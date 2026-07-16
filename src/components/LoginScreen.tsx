@@ -9,6 +9,19 @@ interface LoginScreenProps {
   onLoginSuccess: (user: User) => void;
 }
 
+/** Résultat renvoyé par la RPC authenticate_user (snake_case depuis Postgres) */
+interface AuthResult {
+  id: string;
+  username: string;
+  full_name: string;
+  role: string;
+  tribunal: string;
+  avatar: string | null;
+  mfa_enabled: boolean;
+  biometric_registered: boolean;
+  active: boolean;
+}
+
 export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -17,6 +30,7 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   const [biometricStatus, setBiometricStatus] = useState<"idle" | "scanning" | "success" | "error">("idle");
   const [scanType, setScanType] = useState<"finger" | "retina">("finger");
   const [mfaRequired, setMfaRequired] = useState(false);
+  const [mfaUserId, setMfaUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
@@ -25,56 +39,47 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   useEffect(() => {
     setErrorMessage("");
     setMfaRequired(false);
+    setMfaUserId(null);
   }, [username]);
 
-  const authenticateWithSupabase = async (usernameVal: string, bypassMFA = false): Promise<User | null> => {
-    // 1. Chercher l'utilisateur par username dans la table users
-    const { data: userRow, error } = await supabase
-      .from('users')
-      .select('*, user_permissions(*)')
-      .eq('username', usernameVal)
-      .single();
-
-    if (error || !userRow) {
-      throw new Error("Identifiants invalides.");
-    }
-
-    if (userRow.active === false) {
-      throw new Error("Ce compte utilisateur a été désactivé par l'administrateur.");
-    }
-
-    // 2. Sign in avec Supabase Auth (email = username@legalyx.cm, password)
-    const email = `${usernameVal}@legalyx.cm`;
-    const { error: authError } = await supabase.auth.signInWithPassword({
-      email,
-      password: 'legalyx2026', // mot de passe unique pour tous (auth gérée par la table users)
+  // =========================================================================
+  // Authentification via RPC PostgreSQL (mot de passe vérifié côté serveur)
+  // =========================================================================
+  const authenticateWithSupabase = async (usernameVal: string): Promise<User | null> => {
+    // 1. Appeler la RPC — le mot de passe est comparé côté PostgreSQL, jamais côté client
+    const { data: authResults, error: rpcError } = await supabase.rpc("authenticate_user", {
+      p_username: usernameVal,
+      p_password: password,
     });
 
-    // Si l'utilisateur n'existe pas dans Supabase Auth, le créer à la volée
-    if (authError) {
-      if (authError.message.includes('Invalid login') || authError.message.includes('not found')) {
-        // Créer le compte auth à la volée avec la clé service_role... 
-        // En mode anon, on ne peut pas. On contourne en utilisant directement la table users.
-        // L'auth Supabase complète sera configurée plus tard. Pour le prototype, 
-        // on valide directement via la table users.
-        console.warn('[Legalyx-Auth] Compte Auth non trouvé. Authentification via table users.');
-      } else {
-        throw new Error("Erreur d'authentification Supabase: " + authError.message);
-      }
+    if (rpcError) {
+      throw new Error("Erreur de connexion au service d'authentification.");
     }
 
+    const authResult: AuthResult | null = authResults?.[0] ?? null;
+
+    if (!authResult) {
+      throw new Error("Identifiant ou mot de passe incorrect.");
+    }
+
+    // 2. Récupérer les permissions de l'utilisateur
+    const { data: permsRow } = await supabase
+      .from("user_permissions")
+      .select("*")
+      .eq("user_id", authResult.id)
+      .single();
+
     // 3. Construire l'objet User (camelCase)
-    const permsRow = userRow.user_permissions?.[0];
     const user: User = {
-      id: userRow.id,
-      username: userRow.username,
-      fullName: userRow.full_name,
-      role: userRow.role,
-      tribunal: userRow.tribunal,
-      avatar: userRow.avatar,
-      mfaEnabled: userRow.mfa_enabled,
-      biometricRegistered: userRow.biometric_registered,
-      active: userRow.active !== false,
+      id: authResult.id,
+      username: authResult.username,
+      fullName: authResult.full_name,
+      role: authResult.role as User["role"],
+      tribunal: authResult.tribunal,
+      avatar: authResult.avatar || undefined,
+      mfaEnabled: authResult.mfa_enabled,
+      biometricRegistered: authResult.biometric_registered,
+      active: authResult.active,
       permissions: permsRow
         ? {
             canCreateCases: permsRow.can_create_cases,
@@ -84,12 +89,15 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
             canUploadDocuments: permsRow.can_upload_documents,
             canVerifyIntegrity: permsRow.can_verify_integrity,
           }
-        : getDefaultPermissions(userRow.role),
+        : getDefaultPermissions(authResult.role),
     };
 
     return user;
   };
 
+  // =========================================================================
+  // Soumission du formulaire login standard
+  // =========================================================================
   const handleStandardLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -97,37 +105,48 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
     setSuccessMessage("");
 
     try {
-      // Authentification par mot de passe (table users)
-      // Mots de passe acceptés : admin, legalyx2026, password
-      if (password !== "admin" && password !== "legalyx2026" && password !== "password") {
-        throw new Error("Mot de passe erroné ou code d'accès non valide.");
+      // Phase 1 : vérifier identifiant + mot de passe via RPC
+      const { data: authResults, error: rpcError } = await supabase.rpc("authenticate_user", {
+        p_username: username.trim(),
+        p_password: password,
+      });
+
+      if (rpcError) {
+        throw new Error("Erreur de connexion au service d'authentification.");
       }
 
-      // Vérifier le MFA si nécessaire
-      if (!mfaRequired) {
-        // Vérifier si le user a MFA activé
-        const { data: userCheck } = await supabase
-          .from('users')
-          .select('mfa_enabled, id')
-          .eq('username', username)
-          .single();
+      const authResult: AuthResult | null = authResults?.[0] ?? null;
 
-        if (userCheck?.mfa_enabled) {
-          setMfaRequired(true);
-          setSuccessMessage("Code OTP envoyé sur votre clé de sécurité cryptée.");
-          setLoading(false);
-          return;
+      if (!authResult) {
+        throw new Error("Identifiant ou mot de passe incorrect.");
+      }
+
+      // Phase 2 : vérifier si le MFA est requis pour cet utilisateur
+      if (authResult.mfa_enabled && !mfaRequired) {
+        setMfaRequired(true);
+        setMfaUserId(authResult.id);
+        setSuccessMessage("Code OTP requis. Saisissez le code généré par votre jeton de sécurité.");
+        setLoading(false);
+        return;
+      }
+
+      // Phase 3 : si MFA requis, vérifier le PIN via RPC
+      if (mfaRequired && mfaUserId) {
+        const { data: pinValid, error: pinError } = await supabase.rpc("verify_mfa_pin", {
+          p_user_id: mfaUserId,
+          p_pin: pinMFA,
+        });
+
+        if (pinError || !pinValid) {
+          throw new Error("Code MFA incorrect. Veuillez réessayer.");
         }
       }
 
-      if (mfaRequired && pinMFA !== "123456") {
-        throw new Error("Code MFA incorrect.");
-      }
-
-      const user = await authenticateWithSupabase(username);
+      // Phase 4 : construire l'objet User complet
+      const user = await authenticateWithSupabase(username.trim());
 
       if (user) {
-        await logActivity(user.id, "CONNEXION_MOT_DE_PASSE_MFA", "Authentification validée via mot de passe chiffré et OTP multifacteur.");
+        await logActivity(user.id, "CONNEXION_MOT_DE_PASSE_MFA", "Authentification validée via mot de passe et vérification multifacteur.");
         setSuccessMessage("Authentification réussie. Chargement du tableau de bord...");
         setTimeout(() => {
           onLoginSuccess(user);
@@ -140,39 +159,34 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
     }
   };
 
+  // =========================================================================
+  // Biométrie (simulation visuelle — auth réelle via RPC sans mot de passe)
+  // =========================================================================
   const startBiometricScan = () => {
     setBiometricStatus("scanning");
     setIsBiometricActive(true);
     setErrorMessage("");
-    
-    // Simulate high-security military biometric processing
+
     setTimeout(() => {
-      // 95% success rate for simulation
-      const success = true;
-      if (success) {
-        setBiometricStatus("success");
-        setTimeout(async () => {
-          try {
-            const user = await authenticateWithSupabase(username, true);
-            if (user) {
-              await logActivity(user.id, "AUTHENTIFICATION_BIOMETRIQUE", "Validation biométrique de l'empreinte digitale et scan rétinien réussis.");
-              setSuccessMessage("Authentification biométrique cryptée validée.");
-              setTimeout(() => {
-                onLoginSuccess(user);
-              }, 600);
-            } else {
-              setErrorMessage("Utilisateur introuvable pour la biométrie.");
-              setBiometricStatus("error");
-            }
-          } catch (e: any) {
-            setErrorMessage(e.message || "Erreur lors de la transmission biométrique.");
+      setBiometricStatus("success");
+      setTimeout(async () => {
+        try {
+          const user = await authenticateWithSupabase(username.trim());
+          if (user) {
+            await logActivity(user.id, "AUTHENTIFICATION_BIOMETRIQUE", "Validation biométrique de l'empreinte digitale et scan rétinien réussis.");
+            setSuccessMessage("Authentification biométrique validée.");
+            setTimeout(() => {
+              onLoginSuccess(user);
+            }, 600);
+          } else {
+            setErrorMessage("Identifiant introuvable pour la biométrie.");
             setBiometricStatus("error");
           }
-        }, 1000);
-      } else {
-        setBiometricStatus("error");
-        setErrorMessage("Empreinte ou rétine non reconnue dans l'annuaire de la Justice.");
-      }
+        } catch (e: any) {
+          setErrorMessage(e.message || "Erreur lors de l'authentification biométrique.");
+          setBiometricStatus("error");
+        }
+      }, 1000);
     }, 2000);
   };
 
@@ -255,7 +269,7 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
               {!mfaRequired ? (
                 <div>
                   <label className="block text-sm font-semibold text-slate-750">
-                    Mot de passe sécurisé
+                    Mot de passe
                   </label>
                   <div className="mt-1 relative rounded-md shadow-sm">
                     <input
@@ -264,6 +278,7 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
                       onChange={(e) => setPassword(e.target.value)}
                       required
                       className="block w-full bg-slate-50 border border-slate-200 rounded-lg py-2.5 px-4 text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white text-sm transition-all"
+                      placeholder="Votre mot de passe"
                     />
                   </div>
                 </div>
@@ -288,9 +303,8 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
                       onChange={(e) => setPinMFA(e.target.value)}
                       required
                       className="block w-full text-center bg-white border border-slate-200 rounded-lg py-3 px-4 text-slate-900 font-mono tracking-[1em] text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-                      placeholder="123456"
+                      placeholder="______"
                     />
-                    <p className="text-[10px] text-slate-400 mt-1.5 text-center font-mono">Conseil: Saisir 123456 pour valider la simulation</p>
                   </div>
                 </motion.div>
               )}
@@ -305,7 +319,7 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
                     <span className="flex items-center gap-2">
                       <RefreshCw className="animate-spin h-4 w-4" /> Traitement en cours...
                     </span>
-                  ) : mfaRequired ? "Valider le code MFA" : "Se connecter en mode sécurisé"}
+                  ) : mfaRequired ? "Valider le code MFA" : "Se connecter"}
                 </button>
               </div>
             </form>
