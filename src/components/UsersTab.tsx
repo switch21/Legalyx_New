@@ -14,6 +14,17 @@ import { mapUserFromDb, mapCourtFromDb, getDefaultPermissions, logActivity } fro
 // Avatar par défaut (silhouette générique)
 export const DEFAULT_AVATAR = ""; // vide = icône rendue côté UI
 
+// Validation de la complexité d'un mot de passe
+function validatePasswordStrength(pw: string): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (pw.length < 8) errors.push("Minimum 8 caractères");
+  if (!/[A-Z]/.test(pw)) errors.push("Au moins 1 majuscule");
+  if (!/[a-z]/.test(pw)) errors.push("Au moins 1 minuscule");
+  if (!/[0-9]/.test(pw)) errors.push("Au moins 1 chiffre");
+  if (!/[^A-Za-z0-9]/.test(pw)) errors.push("Au moins 1 caractère spécial");
+  return { valid: errors.length === 0, errors };
+}
+
 interface UsersTabProps {
   currentUser: User;
   onRefreshLogs?: () => void;
@@ -267,6 +278,11 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
             setErrorMsg("Les mots de passe ne correspondent pas.");
             return;
           }
+          const pwValidation = validatePasswordStrength(newPassword);
+          if (!pwValidation.valid) {
+            setErrorMsg("Mot de passe non conforme : " + pwValidation.errors.join(", ") + ".");
+            return;
+          }
           const { error: pwError } = await supabase.rpc("update_user_password", {
             p_user_id: editingUser.id,
             p_new_password: newPassword,
@@ -295,9 +311,15 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
         if (onRefreshLogs) onRefreshLogs();
       } else {
         // CREATE PATH — validate password
-        if (!newPassword || newPassword.length < 4) {
+        if (!newPassword) {
           setSubmittingUser(false);
-          setErrorMsg("Veuillez définir un mot de passe d'au moins 4 caractères.");
+          setErrorMsg("Veuillez définir un mot de passe.");
+          return;
+        }
+        const pwValidation = validatePasswordStrength(newPassword);
+        if (!pwValidation.valid) {
+          setSubmittingUser(false);
+          setErrorMsg("Mot de passe non conforme : " + pwValidation.errors.join(", ") + ".");
           return;
         }
         if (newPassword !== confirmPassword) {
@@ -777,12 +799,18 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
                     
                     {/* Profile */}
                     <div className="flex items-start gap-3">
-                      <img 
-                        src={user.avatar || "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&q=80&w=120"} 
-                        alt={user.fullName} 
-                        className={`w-10 h-10 rounded-full border shadow-sm ${user.active === false ? "opacity-40 grayscale" : "border-slate-200"}`}
-                        referrerPolicy="no-referrer"
-                      />
+                      {user.avatar ? (
+                        <img 
+                          src={user.avatar} 
+                          alt={user.fullName}
+                          className={`w-10 h-10 rounded-full border shadow-sm ${user.active === false ? "opacity-40 grayscale" : "border-slate-200"}`}
+                          referrerPolicy="no-referrer"
+                        />
+                      ) : (
+                        <div className={`w-10 h-10 rounded-full border shadow-sm flex items-center justify-center ${user.active === false ? "opacity-40 grayscale bg-slate-200 border-slate-300" : "bg-blue-50 border-blue-200"}`}>
+                          <Users className={`h-5 w-5 ${user.active === false ? "text-slate-400" : "text-blue-600"}`} />
+                        </div>
+                      )}
                       <div className="space-y-1">
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className={`text-sm font-bold ${user.active === false ? "text-slate-400 line-through" : "text-slate-900"}`}>
@@ -1008,8 +1036,7 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
                     placeholder="ex: M. le Juge Emmanuel Nsame"
                     value={fullName}
                     onChange={(e) => setFullName(e.target.value)}
-                    disabled={!!editingUser} // L'identifiant ne peut pas être modifié après création
-                    className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-xs text-slate-800 focus:outline-none focus:bg-white focus:ring-1 focus:ring-blue-500 font-sans disabled:opacity-60"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-xs text-slate-800 focus:outline-none focus:bg-white focus:ring-1 focus:ring-blue-500 font-sans"
                   />
                 </div>
 
@@ -1032,7 +1059,7 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
                       <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="space-y-2 pt-1">
                         <input
                           type="password"
-                          placeholder="Nouveau mot de passe (min. 4 car.)"
+                          placeholder="Nouveau mot de passe (min. 8 car., maj., min., chiffre, spécial)"
                           value={newPassword}
                           onChange={(e) => setNewPassword(e.target.value)}
                           className="w-full bg-white border border-slate-200 rounded-lg p-2.5 text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-amber-500 font-sans"
@@ -1047,6 +1074,24 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
                         {newPassword && confirmPassword && newPassword !== confirmPassword && (
                           <p className="text-[10px] text-red-600 font-medium">Les mots de passe ne correspondent pas.</p>
                         )}
+                        {newPassword && newPassword.length > 0 && (
+                          (() => {
+                            const v = validatePasswordStrength(newPassword);
+                            return v.valid ? (
+                              <p className="text-[10px] text-emerald-600 font-medium flex items-center gap-1">
+                                <CheckCircle className="h-3 w-3" /> Mot de passe conforme
+                              </p>
+                            ) : (
+                              <div className="text-[10px] text-red-600 font-medium space-y-0.5">
+                                {v.errors.map((e, i) => (
+                                  <p key={i} className="flex items-center gap-1">
+                                    <XCircle className="h-3 w-3" /> {e}
+                                  </p>
+                                ))}
+                              </div>
+                            );
+                          })()
+                        )}
                       </motion.div>
                     )}
                   </div>
@@ -1059,7 +1104,7 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
                       <input
                         type="password"
                         required
-                        placeholder="Définir un mot de passe (min. 4 caractères)"
+                        placeholder="Définir un mot de passe (min. 8 car., maj., min., chiffre, spécial)"
                         value={newPassword}
                         onChange={(e) => setNewPassword(e.target.value)}
                         className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-xs text-slate-800 focus:outline-none focus:bg-white focus:ring-1 focus:ring-blue-500 font-sans"
@@ -1079,6 +1124,24 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
                       />
                       {confirmPassword && newPassword !== confirmPassword && (
                         <p className="text-[10px] text-red-600 font-medium mt-1">Les mots de passe ne correspondent pas.</p>
+                      )}
+                      {newPassword && newPassword.length > 0 && (
+                        (() => {
+                          const v = validatePasswordStrength(newPassword);
+                          return v.valid ? (
+                            <p className="text-[10px] text-emerald-600 font-medium mt-1 flex items-center gap-1">
+                              <CheckCircle className="h-3 w-3" /> Mot de passe conforme
+                            </p>
+                          ) : (
+                            <div className="text-[10px] text-red-600 font-medium mt-1 space-y-0.5">
+                              {v.errors.map((e, i) => (
+                                <p key={i} className="flex items-center gap-1">
+                                  <XCircle className="h-3 w-3" /> {e}
+                                </p>
+                              ))}
+                            </div>
+                          );
+                        })()
                       )}
                     </div>
                   </div>
