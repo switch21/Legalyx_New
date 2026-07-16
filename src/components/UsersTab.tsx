@@ -7,6 +7,8 @@ import {
   Building2, Edit3, Layers, Mail, Phone, Calendar as IconCalendar, Shield, PlusCircle
 } from "lucide-react";
 import { motion } from "motion/react";
+import supabase from "../lib/supabaseClient";
+import { mapUserFromDb, mapCourtFromDb, getDefaultPermissions, logActivity } from "../lib/helpers";
 
 export const AVATAR_PRESETS = [
   "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=120",
@@ -82,13 +84,15 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     setLoading(true);
     setErrorMsg("");
     try {
-      const res = await fetch("/api/users");
-      const data = await res.json();
-      if (data.success) {
-        setUsers(data.users);
-      } else {
-        setErrorMsg(data.message || "Impossible de charger l'annuaire des agents.");
-      }
+      const { data, error } = await supabase
+        .from('users')
+        .select('*, user_permissions(*)')
+        .order('created_at', { ascending: true });
+
+      if (error) throw error;
+
+      const mapped = (data || []).map((u: any) => mapUserFromDb(u, u.user_permissions?.[0]));
+      setUsers(mapped);
     } catch (err) {
       console.error(err);
       setErrorMsg("Erreur lors du chargement des agents judiciaires.");
@@ -101,16 +105,17 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     setLoading(true);
     setErrorMsg("");
     try {
-      const res = await fetch("/api/courts");
-      const data = await res.json();
-      if (data.success) {
-        setCourts(data.courtProfiles || []);
-        // Update default tribunal selection in user form if available
-        if (data.courtProfiles && data.courtProfiles.length > 0 && !editingUser) {
-          setTribunal(data.courtProfiles[0].name);
-        }
-      } else {
-        setErrorMsg(data.message || "Impossible de charger les profils des tribunaux.");
+      const { data, error } = await supabase
+        .from('court_profiles')
+        .select('*')
+        .order('name', { ascending: true });
+
+      if (error) throw error;
+
+      const mapped = (data || []).map(mapCourtFromDb);
+      setCourts(mapped);
+      if (mapped.length > 0 && !editingUser) {
+        setTribunal(mapped[0].name);
       }
     } catch (err) {
       console.error(err);
@@ -199,69 +204,98 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     try {
       if (editingUser) {
         // UPDATE PATH
-        const res = await fetch(`/api/users/${editingUser.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            adminId: currentUser.id,
-            fullName,
+        const { data: updated, error } = await supabase
+          .from('users')
+          .update({
+            full_name: fullName,
             role,
             tribunal,
-            permissions,
-            avatar
+            avatar,
           })
-        });
+          .eq('id', editingUser.id)
+          .select()
+          .single();
 
-        const data = await res.json();
         setSubmittingUser(false);
+        if (error) { setErrorMsg(error.message || "Erreur lors de la mise à jour de l'agent."); return; }
 
-        if (!res.ok) {
-          setErrorMsg(data.message || "Erreur lors de la mise à jour de l'agent.");
-          return;
-        }
+        // Update permissions
+        await supabase
+          .from('user_permissions')
+          .update({
+            can_create_cases: permissions.canCreateCases,
+            can_delete_cases: permissions.canDeleteCases,
+            can_edit_plumitif: permissions.canEditPlumitif,
+            can_manage_hearings: permissions.canManageHearings,
+            can_upload_documents: permissions.canUploadDocuments,
+            can_verify_integrity: permissions.canVerifyIntegrity,
+          })
+          .eq('user_id', editingUser.id);
 
-        if (data.success) {
-          setSuccessMsg(`Les habilitations de l'agent ${fullName} ont été configurées avec succès.`);
-          cancelEditUser();
-          fetchUsers();
-          if (onRefreshLogs) onRefreshLogs();
-        }
+        await logActivity(currentUser.id, 'MIS_A_JOUR_HABILITATIONS', `Habilitations granulaires modifiées pour ${fullName}`);
+
+        setSuccessMsg(`Les habilitations de l'agent ${fullName} ont été configurées avec succès.`);
+        cancelEditUser();
+        fetchUsers();
+        if (onRefreshLogs) onRefreshLogs();
       } else {
-        // CREATE PATH
-        const res = await fetch("/api/users", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            adminId: currentUser.id,
-            username,
-            fullName,
-            role,
-            tribunal,
-            mfaEnabled,
-            biometricRegistered,
-            permissions,
-            avatar
-          })
-        });
+        // CREATE PATH — check uniqueness first
+        const { data: existing } = await supabase
+          .from('users')
+          .select('id')
+          .ilike('username', username.trim())
+          .single();
 
-        const data = await res.json();
-        setSubmittingUser(false);
-
-        if (!res.ok) {
-          setErrorMsg(data.message || "Erreur de création de l'agent.");
+        if (existing) {
+          setSubmittingUser(false);
+          setErrorMsg("Cet identifiant unique est déjà attribué à un autre agent.");
           return;
         }
 
-        if (data.success) {
-          setSuccessMsg(`L'officier judiciaire ${fullName} a été enrôlé dans l'annuaire.`);
-          // Reset form
-          setFullName("");
-          setUsername("");
-          setMfaEnabled(true);
-          setBiometricRegistered(true);
-          fetchUsers();
-          if (onRefreshLogs) onRefreshLogs();
-        }
+        const newUserId = `u_${Date.now()}`;
+        const finalAvatar = avatar || AVATAR_PRESETS[0];
+
+        const { data: newUser, error: userError } = await supabase
+          .from('users')
+          .insert({
+            id: newUserId,
+            username: username.toLowerCase().trim(),
+            full_name: fullName.trim(),
+            role,
+            tribunal: tribunal.trim(),
+            avatar: finalAvatar,
+            mfa_enabled: mfaEnabled ?? true,
+            biometric_registered: biometricRegistered ?? true,
+            password_hash: "$2b$12$LJ3m5ys2LkG9RrLqT6W3XeZ7p1K9w0mN5b8v2q4x6zA0c3E5g7I9",
+            active: true,
+          })
+          .select()
+          .single();
+
+        setSubmittingUser(false);
+        if (userError) { setErrorMsg(userError.message || "Erreur de création de l'agent."); return; }
+
+        // Insert permissions
+        await supabase.from('user_permissions').insert({
+          id: `perm_${newUserId}`,
+          user_id: newUserId,
+          can_create_cases: permissions.canCreateCases ?? false,
+          can_delete_cases: permissions.canDeleteCases ?? false,
+          can_edit_plumitif: permissions.canEditPlumitif ?? false,
+          can_manage_hearings: permissions.canManageHearings ?? false,
+          can_upload_documents: permissions.canUploadDocuments ?? false,
+          can_verify_integrity: permissions.canVerifyIntegrity ?? false,
+        });
+
+        await logActivity(currentUser.id, 'ENREGISTREMENT_UTILISATEUR', `Création du profil de l'agent : ${fullName.trim()} (${role})`);
+
+        setSuccessMsg(`L'officier judiciaire ${fullName} a été enrôlé dans l'annuaire.`);
+        setFullName("");
+        setUsername("");
+        setMfaEnabled(true);
+        setBiometricRegistered(true);
+        fetchUsers();
+        if (onRefreshLogs) onRefreshLogs();
       }
     } catch (err) {
       setSubmittingUser(false);
@@ -323,23 +357,20 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     const newActiveState = user.active === false ? true : false;
 
     try {
-      const res = await fetch(`/api/users/${user.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          adminId: currentUser.id,
-          active: newActiveState
-        })
-      });
+      const { data: updated, error } = await supabase
+        .from('users')
+        .update({ active: newActiveState })
+        .eq('id', user.id)
+        .select()
+        .single();
 
-      const data = await res.json();
-      if (data.success) {
-        setSuccessMsg(`Le compte de ${user.fullName} est maintenant ${newActiveState ? "actif" : "suspendu"}.`);
-        fetchUsers();
-        if (onRefreshLogs) onRefreshLogs();
-      } else {
-        setErrorMsg(data.message || "Erreur lors du changement de statut.");
-      }
+      if (error) { setErrorMsg(error.message || "Erreur lors du changement de statut."); return; }
+
+      await logActivity(currentUser.id, newActiveState ? 'ACTIVATION_UTILISATEUR' : 'DESACTIVATION_UTILISATEUR', `Statut du compte de ${updated.full_name} modifié à : ${newActiveState ? 'actif' : 'désactivé'}`, 'USER_MANAGEMENT', newActiveState ? 'INFO' : 'WARNING');
+
+      setSuccessMsg(`Le compte de ${user.fullName} est maintenant ${newActiveState ? "actif" : "suspendu"}.`);
+      fetchUsers();
+      if (onRefreshLogs) onRefreshLogs();
     } catch (err) {
       console.error(err);
       setErrorMsg("Erreur lors du changement de statut de l'agent.");
@@ -359,18 +390,17 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     setSuccessMsg("");
 
     try {
-      const res = await fetch(`/api/users/${user.id}?adminId=${currentUser.id}`, {
-        method: "DELETE"
-      });
+      // Supprimer les permissions d'abord
+      await supabase.from('user_permissions').delete().eq('user_id', user.id);
 
-      const data = await res.json();
-      if (data.success) {
-        setSuccessMsg(`L'agent ${user.fullName} a été définitivement supprimé de la base sécurisée.`);
-        fetchUsers();
-        if (onRefreshLogs) onRefreshLogs();
-      } else {
-        setErrorMsg(data.message || "Erreur lors de la radiation de l'agent.");
-      }
+      const { error } = await supabase.from('users').delete().eq('id', user.id);
+      if (error) { setErrorMsg(error.message || "Erreur lors de la radiation de l'agent."); return; }
+
+      await logActivity(currentUser.id, 'SUPPRESSION_UTILISATEUR', `Compte définitivement supprimé : ${user.fullName} (${user.role})`, 'USER_MANAGEMENT', 'CRITICAL');
+
+      setSuccessMsg(`L'agent ${user.fullName} a été définitivement supprimé de la base sécurisée.`);
+      fetchUsers();
+      if (onRefreshLogs) onRefreshLogs();
     } catch (err) {
       console.error(err);
       setErrorMsg("Impossible d'exécuter la radiation.");
@@ -407,54 +437,66 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     try {
       if (editingCourt) {
         // UPDATE PATH
-        const res = await fetch(`/api/courts/${editingCourt.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
+        const { data: updated, error } = await supabase
+          .from('court_profiles')
+          .update({
+            name: courtName.trim(),
+            type: courtType.trim(),
+            president: courtPresident.trim(),
+            address: courtAddress?.trim(),
+            phone: courtPhone?.trim(),
+            email: courtEmail?.trim(),
+            jurisdiction_region: courtRegion?.trim(),
+            founding_date: courtFoundingDate || null,
+            active_chambers: chambers,
+          })
+          .eq('id', editingCourt.id)
+          .select()
+          .single();
 
-        const data = await res.json();
         setSubmittingCourt(false);
+        if (error) { setErrorMsg(error.message || "Erreur lors de la modification du tribunal."); return; }
 
-        if (!res.ok) {
-          setErrorMsg(data.message || "Erreur lors de la modification du tribunal.");
-          return;
-        }
+        await logActivity(currentUser.id, 'MISE_A_JOUR_TRIBUNAL', `Mise à jour du profil du tribunal : ${updated.name}`);
 
-        if (data.success) {
-          setSuccessMsg(`Le profil du tribunal ${courtName} a été mis à jour.`);
-          cancelEditCourt();
-          fetchCourts();
-          if (onRefreshLogs) onRefreshLogs();
-        }
+        setSuccessMsg(`Le profil du tribunal ${courtName} a été mis à jour.`);
+        cancelEditCourt();
+        fetchCourts();
+        if (onRefreshLogs) onRefreshLogs();
       } else {
         // CREATE PATH
-        const res = await fetch("/api/courts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
+        const { data: newCourt, error } = await supabase
+          .from('court_profiles')
+          .insert({
+            id: `court_${Date.now()}`,
+            name: courtName.trim(),
+            type: courtType.trim(),
+            president: courtPresident.trim(),
+            address: courtAddress?.trim(),
+            phone: courtPhone?.trim(),
+            email: courtEmail?.trim(),
+            jurisdiction_region: courtRegion?.trim(),
+            founding_date: courtFoundingDate || null,
+            active_chambers: chambers,
+          })
+          .select()
+          .single();
 
-        const data = await res.json();
         setSubmittingCourt(false);
+        if (error) { setErrorMsg(error.message || "Erreur lors de la création du tribunal."); return; }
 
-        if (!res.ok) {
-          setErrorMsg(data.message || "Erreur lors de la création du tribunal.");
-          return;
-        }
+        await logActivity(currentUser.id, 'CREATION_PROFIL_TRIBUNAL', `Création du profil du tribunal : ${newCourt.name} (${newCourt.type})`);
 
-        if (data.success) {
-          setSuccessMsg(`Le nouveau profil de tribunal "${courtName}" a été créé.`);
-          setCourtName("");
-          setCourtPresident("");
-          setCourtAddress("");
-          setCourtPhone("");
-          setCourtEmail("");
-          setCourtFoundingDate("");
-          setCourtChambersText("Chambre Civile, Chambre Pénale, Chambre Commerciale");
-          fetchCourts();
-          if (onRefreshLogs) onRefreshLogs();
-        }
+        setSuccessMsg(`Le nouveau profil de tribunal "${courtName}" a été créé.`);
+        setCourtName("");
+        setCourtPresident("");
+        setCourtAddress("");
+        setCourtPhone("");
+        setCourtEmail("");
+        setCourtFoundingDate("");
+        setCourtChambersText("Chambre Civile, Chambre Pénale, Chambre Commerciale");
+        fetchCourts();
+        if (onRefreshLogs) onRefreshLogs();
       }
     } catch (err) {
       setSubmittingCourt(false);
@@ -496,18 +538,14 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     setSuccessMsg("");
 
     try {
-      const res = await fetch(`/api/courts/${court.id}?adminId=${currentUser.id}`, {
-        method: "DELETE"
-      });
+      const { error } = await supabase.from('court_profiles').delete().eq('id', court.id);
+      if (error) { setErrorMsg(error.message || "Erreur lors de la suppression."); return; }
 
-      const data = await res.json();
-      if (data.success) {
-        setSuccessMsg(`Le profil du tribunal ${court.name} a été retiré.`);
-        fetchCourts();
-        if (onRefreshLogs) onRefreshLogs();
-      } else {
-        setErrorMsg(data.message || "Erreur lors de la suppression.");
-      }
+      await logActivity(currentUser.id, 'SUPPRESSION_TRIBUNAL', `Désactivation du profil du tribunal : ${court.name}`, 'COURT_MANAGEMENT', 'WARNING');
+
+      setSuccessMsg(`Le profil du tribunal ${court.name} a été retiré.`);
+      fetchCourts();
+      if (onRefreshLogs) onRefreshLogs();
     } catch (err) {
       console.error(err);
       setErrorMsg("Impossible de supprimer le tribunal.");

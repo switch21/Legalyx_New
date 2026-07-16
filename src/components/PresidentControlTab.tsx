@@ -6,6 +6,8 @@ import {
   ChevronRight, RefreshCw, Star, BarChart3, Mail, HeartPulse
 } from "lucide-react";
 import { motion } from "motion/react";
+import supabase from "../lib/supabaseClient";
+import { mapUserFromDb, logActivity } from "../lib/helpers";
 
 interface PresidentControlTabProps {
   currentUser: User;
@@ -34,15 +36,17 @@ export default function PresidentControlTab({
   const fetchUsers = async () => {
     setLoadingUsers(true);
     try {
-      const res = await fetch("/api/users");
-      const data = await res.json();
-      if (data.success) {
-        setUsers(data.users);
-        // Default select the first Juge or Greffier if none is selected
-        if (!selectedUser && data.users.length > 0) {
-          const firstNonAdmin = data.users.find((u: User) => u.role !== "Administrateur");
-          if (firstNonAdmin) setSelectedUser(firstNonAdmin);
-        }
+      const { data, error } = await supabase
+        .from('users')
+        .select('*, user_permissions(*)')
+        .order('created_at', { ascending: true });
+      if (error) throw error;
+
+      const mapped = (data || []).map((u: any) => mapUserFromDb(u, u.user_permissions?.[0]));
+      setUsers(mapped);
+      if (!selectedUser && mapped.length > 0) {
+        const firstNonAdmin = mapped.find((u: User) => u.role !== "Administrateur");
+        if (firstNonAdmin) setSelectedUser(firstNonAdmin);
       }
     } catch (err) {
       console.error("Erreur lors de la récupération des agents:", err);
@@ -88,28 +92,25 @@ export default function PresidentControlTab({
     setUpdatingCaseId(caseId);
     setSuccessMessage("");
     try {
-      const response = await fetch(`/api/cases/${caseId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          magistratId: targetMagistrat.id,
-          magistratName: targetMagistrat.fullName
-        })
-      });
+      const { data: updated, error } = await supabase
+        .from('cases')
+        .update({ magistrat_id: targetMagistrat.id })
+        .eq('id', caseId)
+        .select()
+        .single();
 
-      const data = await response.json();
-      if (data.success) {
-        setSuccessMessage(`Dossier réalloué avec succès au cabinet de ${targetMagistrat.fullName}.`);
-        onRefreshData();
-        setReassigningCaseId(null);
-        // Refresh selected user cases if applicable
-        if (selectedUser) {
-          const freshSelectedUser = users.find(u => u.id === selectedUser.id);
-          if (freshSelectedUser) setSelectedUser(freshSelectedUser);
-        }
-        setTimeout(() => setSuccessMessage(""), 4000);
+      if (error) { console.error(error); return; }
+
+      await logActivity(currentUser.id, 'REAFFECTATION_DOSSIER', `Dossier ${updated.num_dossier} réalloué au cabinet de ${targetMagistrat.fullName}`);
+
+      setSuccessMessage(`Dossier réalloué avec succès au cabinet de ${targetMagistrat.fullName}.`);
+      onRefreshData();
+      setReassigningCaseId(null);
+      if (selectedUser) {
+        const freshSelectedUser = users.find(u => u.id === selectedUser.id);
+        if (freshSelectedUser) setSelectedUser(freshSelectedUser);
       }
+      setTimeout(() => setSuccessMessage(""), 4000);
     } catch (err) {
       console.error("Échec de la réallocation:", err);
     } finally {

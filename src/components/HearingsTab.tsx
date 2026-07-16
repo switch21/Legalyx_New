@@ -6,6 +6,8 @@ import {
   Paperclip, Trash2, Eye, Hash
 } from "lucide-react";
 import { motion } from "motion/react";
+import supabase from "../lib/supabaseClient";
+import { logActivity, generateMinutes } from "../lib/helpers";
 
 interface HearingsTabProps {
   hearings: Hearing[];
@@ -65,28 +67,35 @@ export default function HearingsTab({ hearings, cases, currentUser, onRefreshHea
     const simulatedSize = `${(file.size / (1024 * 1024)).toFixed(2)} MB`;
 
     try {
-      const response = await fetch(`/api/cases/${associatedCaseForSelectedHearing.id}/documents`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          name: file.name,
-          type: "Pièce jointe",
-          size: simulatedSize,
-          hearingId: selectedHearing.id
-        })
-      });
+      const content = `${file.name}-${Date.now()}`;
+      const encoder = new TextEncoder();
+      const dataBuf = encoder.encode(content);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', dataBuf);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const simulatedHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
-      const data = await response.json();
-      if (data.success) {
-        setSuccessMsg(`Document "${file.name}" ajouté avec succès à l'audience.`);
-        onRefreshHearings();
-      } else {
-        setErrorMsg("Erreur lors de la numérisation du document.");
-      }
+      const { error } = await supabase
+        .from('case_documents')
+        .insert({
+          id: `doc_${Date.now()}`,
+          case_id: associatedCaseForSelectedHearing.id,
+          hearing_id: selectedHearing.id,
+          name: file.name,
+          type: 'Pièce jointe',
+          hash: simulatedHash,
+          size: simulatedSize,
+          uploaded_by: currentUser.fullName,
+          secure: true,
+        });
+
+      if (error) { setErrorMsg('Erreur lors de la numérisation du document.'); return; }
+
+      await logActivity(currentUser.id, 'NUMERISATION_DOCUMENT', `Document ajouté à l'audience : ${file.name}`);
+      setSuccessMsg(`Document "${file.name}" ajouté avec succès à l'audience.`);
+      onRefreshHearings();
     } catch (err) {
       console.error(err);
-      setErrorMsg("Erreur de communication avec le serveur de numérisation.");
+      setErrorMsg('Erreur de communication avec le serveur de numérisation.');
     } finally {
       setUploadingDoc(false);
     }
@@ -94,22 +103,20 @@ export default function HearingsTab({ hearings, cases, currentUser, onRefreshHea
 
   const handleDeleteDocFromHearing = async (docId: string) => {
     if (!associatedCaseForSelectedHearing) return;
-    if (!confirm("Voulez-vous détruire cette pièce jointe ?")) return;
+    if (!confirm('Voulez-vous détruire cette pièce jointe ?')) return;
     setSuccessMsg("");
     setErrorMsg("");
 
     try {
-      const response = await fetch(`/api/cases/${associatedCaseForSelectedHearing.id}/documents/${docId}?userId=${currentUser.id}`, {
-        method: "DELETE"
-      });
-      const data = await response.json();
-      if (data.success) {
-        setSuccessMsg("Document supprimé définitivement.");
-        onRefreshHearings();
-      }
+      const { error } = await supabase.from('case_documents').delete().eq('id', docId);
+      if (error) { setErrorMsg('Erreur de suppression.'); return; }
+
+      await logActivity(currentUser.id, 'SUPPRESSION_DOCUMENT', `Document supprimé d'une audience`, 'DOCUMENT_MANAGEMENT', 'WARNING');
+      setSuccessMsg('Document supprimé définitivement.');
+      onRefreshHearings();
     } catch (e) {
       console.error(e);
-      setErrorMsg("Erreur de suppression.");
+      setErrorMsg('Erreur de suppression.');
     }
   };
 
@@ -119,34 +126,40 @@ export default function HearingsTab({ hearings, cases, currentUser, onRefreshHea
     if (!scheduleCaseId || !scheduleDate) return;
 
     try {
-      const response = await fetch("/api/hearings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          caseId: scheduleCaseId,
-          date: scheduleDate,
-          time: scheduleTime,
-          room: scheduleRoom,
-          notes: scheduleNotes
-        })
-      });
+      const { data: dossier } = await supabase.from('cases').select('num_dossier, title').eq('id', scheduleCaseId).single();
+      if (!dossier) { setErrorMsg('Le dossier spécifié est inexistant.'); return; }
 
-      const data = await response.json();
-      if (data.success) {
-        setShowScheduleForm(false);
-        setScheduleCaseId("");
-        setScheduleDate("");
-        setScheduleNotes("");
-        onRefreshHearings();
-        setSuccessMsg("Audience ajoutée avec succès au rôle.");
-      }
+      const { data: newHearing, error } = await supabase
+        .from('hearings')
+        .insert({
+          id: `h_${Date.now()}`,
+          case_id: scheduleCaseId,
+          date: scheduleDate,
+          time: scheduleTime || '09:00',
+          type: 'Audience publique',
+          location: scheduleRoom || 'Chambre Civile I',
+          status: 'Planifiée',
+          notes: scheduleNotes || '',
+        })
+        .select()
+        .single();
+
+      if (error) { console.error(error); return; }
+
+      await logActivity(currentUser.id, 'PLANIFICATION_AUDIENCE', `Audience planifiée pour le dossier ${dossier.num_dossier} le ${scheduleDate} à ${scheduleTime} (${scheduleRoom})`);
+
+      setShowScheduleForm(false);
+      setScheduleCaseId("");
+      setScheduleDate("");
+      setScheduleNotes("");
+      onRefreshHearings();
+      setSuccessMsg('Audience ajoutée avec succès au rôle.');
     } catch (err) {
       console.error(err);
     }
   };
 
-  // Compile draft notes using Gemini API
+  // Compile draft notes using Gemini API (direct call from browser)
   const handleAICompileMinutes = async () => {
     if (!selectedHearing) return;
     setCompilingAI(true);
@@ -156,41 +169,31 @@ export default function HearingsTab({ hearings, cases, currentUser, onRefreshHea
     const associatedCase = cases.find(c => c.id === selectedHearing.caseId);
 
     try {
-      const response = await fetch("/api/generate-minutes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          notes: hearingNotes,
-          caseNum: selectedHearing.numDossier,
-          caseTitle: selectedHearing.caseTitle,
-          tribunalName: associatedCase?.tribunal || currentUser.tribunal,
-          dateAudience: selectedHearing.date,
-          greffierName: selectedHearing.greffierName || currentUser.fullName,
-        })
-      });
+      const { text: compteRendu, simulated } = await generateMinutes(
+        hearingNotes,
+        selectedHearing.numDossier,
+        selectedHearing.caseTitle,
+        associatedCase?.tribunal || currentUser.tribunal,
+        selectedHearing.date,
+        selectedHearing.greffierName || currentUser.fullName,
+      );
 
-      const data = await response.json();
-      if (data.success) {
-        setCompteRenduText(data.compteRendu);
-        
-        // Auto-save generated report back to this hearing
-        await fetch(`/api/hearings/${selectedHearing.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            userId: currentUser.id,
-            compteRendu: data.compteRendu,
-            notes: hearingNotes
-          })
-        });
+      setCompteRenduText(compteRendu);
+      
+      // Auto-save generated report back to this hearing
+      const { error } = await supabase
+        .from('hearings')
+        .update({ transcript: compteRendu, notes: hearingNotes })
+        .eq('id', selectedHearing.id);
 
-        onRefreshHearings();
-        setSuccessMsg("Le compte-rendu a été compilé et structuré par Legalyx-AI.");
-      } else {
-        setErrorMsg(data.message || "Erreur lors de la compilation par IA.");
+      if (!error) {
+        await logActivity(currentUser.id, 'GENERATION_COMPTE_RENDU_IA', `Compte-rendu IA ${simulated ? '(simulé)' : '(Gemini)'} généré pour l'audience du ${selectedHearing.date}`);
       }
-    } catch (e) {
-      setErrorMsg("Impossible de joindre le service de compilation IA.");
+
+      onRefreshHearings();
+      setSuccessMsg('Le compte-rendu a été compilé et structuré par Legalyx-AI.');
+    } catch (e: any) {
+      setErrorMsg('Impossible de joindre le service de compilation IA.');
     } finally {
       setCompilingAI(false);
     }
@@ -200,24 +203,43 @@ export default function HearingsTab({ hearings, cases, currentUser, onRefreshHea
   const handleUpdateHearingDetails = async (newStatus?: Hearing["status"]) => {
     if (!selectedHearing) return;
     try {
-      const response = await fetch(`/api/hearings/${selectedHearing.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          status: newStatus || selectedHearing.status,
-          notes: hearingNotes,
-          compteRendu: compteRenduText
-        })
+      const updatePayload: any = {
+        notes: hearingNotes,
+        transcript: compteRenduText,
+      };
+      if (newStatus) updatePayload.status = newStatus;
+
+      const { data: updated, error } = await supabase
+        .from('hearings')
+        .update(updatePayload)
+        .eq('id', selectedHearing.id)
+        .select()
+        .single();
+
+      if (error) { setErrorMsg('Erreur lors de la mise à jour.'); return; }
+
+      await logActivity(currentUser.id, 'MODIFICATION_AUDIENCE', `Audience mise à jour (ID: ${selectedHearing.id}, Statut: ${updated.status})`);
+
+      // Update local state with mapped hearing
+      const linkedCase = cases.find(c => c.id === updated.case_id);
+      setSelectedHearing({
+        id: updated.id,
+        caseId: updated.case_id,
+        numDossier: linkedCase?.numDossier || selectedHearing.numDossier,
+        caseTitle: linkedCase?.title || selectedHearing.caseTitle,
+        date: updated.date,
+        time: updated.time?.substring(0, 5) || '09:00',
+        room: updated.location,
+        status: updated.status,
+        notes: updated.notes,
+        compteRendu: updated.transcript,
+        greffierName: selectedHearing.greffierName,
+        reporter: updated.signed_by,
       });
-      const data = await response.json();
-      if (data.success) {
-        setSelectedHearing(data.hearing);
-        onRefreshHearings();
-        setSuccessMsg("Audience enregistrée et synchronisée avec le greffe.");
-      }
+      onRefreshHearings();
+      setSuccessMsg('Audience enregistrée et synchronisée avec le greffe.');
     } catch (e) {
-      setErrorMsg("Erreur lors de la mise à jour.");
+      setErrorMsg('Erreur lors de la mise à jour.');
     }
   };
 

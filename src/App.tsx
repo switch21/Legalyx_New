@@ -14,12 +14,14 @@ import {
   FileText, Award
 } from "lucide-react";
 import { motion } from "motion/react";
+import supabase from "./lib/supabaseClient";
+import { mapCaseFromDb, mapHearingFromDb, mapActivityFromDb, getDefaultPermissions } from "./lib/helpers";
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [activeTab, setActiveTab] = useState<"dashboard" | "cases" | "hearings" | "audit" | "users" | "reports" | "president-control">("dashboard");
   
-  // App-wide data states synced with full-stack server
+  // App-wide data states
   const [cases, setCases] = useState<Case[]>([]);
   const [hearings, setHearings] = useState<Hearing[]>([]);
   const [activities, setActivities] = useState<ActivityLog[]>([]);
@@ -35,13 +37,16 @@ export default function App() {
     } else {
       setActiveTab("dashboard");
     }
-    // Fetch initial workspace data once user is authenticated
     fetchWorkspaceData();
   };
 
   const handleLogout = () => {
     setCurrentUser(null);
     setActiveTab("dashboard");
+    setCases([]);
+    setHearings([]);
+    setActivities([]);
+    setStats(null);
   };
 
   const fetchWorkspaceData = async () => {
@@ -52,23 +57,23 @@ export default function App() {
       if (currentUser.role === "Administrateur") {
         // Administrators only fetch non-case/non-hearing resources
         const [activitiesRes, statsRes] = await Promise.all([
-          fetch(`/api/activities?userId=${currentUser.id}`).then(r => r.json()),
-          fetch(`/api/stats?userId=${currentUser.id}`).then(r => r.json())
+          fetchActivities(),
+          fetchStats(),
         ]);
-        if (activitiesRes.success) setActivities(activitiesRes.logs);
-        if (statsRes.success) setStats(statsRes.stats);
+        if (activitiesRes) setActivities(activitiesRes);
+        if (statsRes) setStats(statsRes);
       } else {
         const [casesRes, hearingsRes, activitiesRes, statsRes] = await Promise.all([
-          fetch(`/api/cases?userId=${currentUser.id}`).then(r => r.json()),
-          fetch(`/api/hearings?userId=${currentUser.id}`).then(r => r.json()),
-          fetch(`/api/activities?userId=${currentUser.id}`).then(r => r.json()),
-          fetch(`/api/stats?userId=${currentUser.id}`).then(r => r.json())
+          fetchCases(),
+          fetchHearings(),
+          fetchActivities(),
+          fetchStats(),
         ]);
 
-        if (casesRes.success) setCases(casesRes.cases);
-        if (hearingsRes.success) setHearings(hearingsRes.hearings);
-        if (activitiesRes.success) setActivities(activitiesRes.logs);
-        if (statsRes.success) setStats(statsRes.stats);
+        if (casesRes) setCases(casesRes);
+        if (hearingsRes) setHearings(hearingsRes);
+        if (activitiesRes) setActivities(activitiesRes);
+        if (statsRes) setStats(statsRes);
       }
 
     } catch (err) {
@@ -76,6 +81,133 @@ export default function App() {
       setErrorText("Erreur lors de la synchronisation sécurisée avec le serveur central Legalyx.");
     } finally {
       setLoading(false);
+    }
+  };
+
+  // ========================================================================
+  // FETCH DIRECT SUPABASE — Dossiers
+  // ========================================================================
+  const fetchCases = async (): Promise<Case[] | null> => {
+    const { data, error } = await supabase
+      .from('cases')
+      .select('*, case_documents(*)')
+      .order('created_at', { ascending: false });
+
+    if (error) { console.error('[Cases]', error); return null; }
+
+    const rows = data || [];
+
+    // Enrichir avec le nom du magistrat
+    const magistratIds = [...new Set(rows.filter(c => c.magistrat_id).map(c => c.magistrat_id))];
+    let magMap: Record<string, string> = {};
+    if (magistratIds.length > 0) {
+      const { data: magistrats } = await supabase
+        .from('users')
+        .select('id, full_name')
+        .in('id', magistratIds);
+      magMap = Object.fromEntries((magistrats || []).map((m: any) => [m.id, m.full_name]));
+    }
+
+    return rows.map((c: any) => mapCaseFromDb(c, c.case_documents, magMap[c.magistrat_id]));
+  };
+
+  // ========================================================================
+  // FETCH DIRECT SUPABASE — Audiences
+  // ========================================================================
+  const fetchHearings = async (): Promise<Hearing[] | null> => {
+    const { data, error } = await supabase
+      .from('hearings')
+      .select('*')
+      .order('date', { ascending: false });
+
+    if (error) { console.error('[Hearings]', error); return null; }
+
+    const rows = data || [];
+
+    // Enrichir avec les infos des dossiers liés
+    const caseIds = [...new Set(rows.map((h: any) => h.case_id))];
+    let caseMap: Record<string, any> = {};
+    if (caseIds.length > 0) {
+      const { data: linkedCases } = await supabase
+        .from('cases')
+        .select('id, num_dossier, title')
+        .in('id', caseIds);
+      caseMap = Object.fromEntries((linkedCases || []).map((c: any) => [c.id, c]));
+    }
+
+    return rows.map((h: any) => mapHearingFromDb(h, caseMap[h.case_id]));
+  };
+
+  // ========================================================================
+  // FETCH DIRECT SUPABASE — Activités
+  // ========================================================================
+  const fetchActivities = async (): Promise<ActivityLog[] | null> => {
+    const { data, error } = await supabase
+      .from('activity_logs')
+      .select('*')
+      .order('timestamp', { ascending: false });
+
+    if (error) { console.error('[Activities]', error); return null; }
+
+    return (data || []).map(mapActivityFromDb);
+  };
+
+  // ========================================================================
+  // FETCH DIRECT SUPABASE — Statistiques
+  // ========================================================================
+  const fetchStats = async (): Promise<AppStats | null> => {
+    try {
+      const [natureData, statusData, docsResult, hearingsData, urgentResult] = await Promise.all([
+        supabase.from('cases').select('nature, priority'),
+        supabase.from('cases').select('status'),
+        supabase.from('case_documents').select('*', { count: 'exact', head: true }),
+        supabase.from('hearings').select('status'),
+        supabase.from('cases').select('*', { count: 'exact', head: true }).eq('priority', 'Urgente'),
+      ]);
+
+      const natureCounts: Record<string, number> = {};
+      (natureData.data || []).forEach((c: any) => {
+        natureCounts[c.nature] = (natureCounts[c.nature] || 0) + 1;
+      });
+
+      const statusCounts: Record<string, number> = {};
+      (statusData.data || []).forEach((c: any) => {
+        statusCounts[c.status] = (statusCounts[c.status] || 0) + 1;
+      });
+
+      const activeHearings = (hearingsData.data || []).filter(
+        (h: any) => h.status === 'Planifiée' || h.status === 'En cours'
+      ).length;
+
+      const totalCases = natureData.data?.length || 0;
+
+      return {
+        totalCases,
+        activeHearings,
+        urgentCases: urgentResult.count || 0,
+        digitizedDocsCount: docsResult.count || 0,
+        byNature: [
+          { name: 'Pénal', value: natureCounts['Pénal'] || 0 },
+          { name: 'Civil', value: natureCounts['Civil'] || 0 },
+          { name: 'Administratif', value: natureCounts['Administratif'] || 0 },
+          { name: 'Commercial', value: natureCounts['Commercial'] || 0 },
+          { name: 'Social', value: natureCounts['Social'] || 0 },
+        ],
+        byStatus: [
+          { name: 'En cours', value: statusCounts['En cours'] || 0 },
+          { name: 'En délibéré', value: statusCounts['Mis en délibéré'] || 0 },
+          { name: 'Clôturé', value: statusCounts['Clôturé'] || 0 },
+          { name: 'Archivé', value: statusCounts['Archivé'] || 0 },
+        ],
+        monthlyActivity: [
+          { month: 'Mai', dossiers: 0, audiences: 0 },
+          { month: 'Juin', dossiers: 0, audiences: 0 },
+          { month: 'Juillet', dossiers: totalCases, audiences: hearingsData.data?.length || 0 },
+        ],
+      };
+    } catch (err) {
+      console.error('[Stats]', err);
+      return null;
     }
   };
 

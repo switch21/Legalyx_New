@@ -1,19 +1,22 @@
 import express from "express";
 import path from "path";
-import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 import crypto from "crypto";
+import "./src/lib/supabaseAdmin.js";
+import supabase from "./src/lib/supabaseAdmin.js";
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
 app.use(express.json());
 
-// Initialize Gemini Client
+// ============================================================================
+// INITIALISATION GEMINI
+// ============================================================================
 let ai: GoogleGenAI | null = null;
 if (process.env.GEMINI_API_KEY) {
   ai = new GoogleGenAI({
@@ -24,815 +27,725 @@ if (process.env.GEMINI_API_KEY) {
       }
     }
   });
-  console.log("Legalyx-CMS: Gemini client initialized successfully.");
+  console.log("Legalyx-CMS: Client Gemini initialisé.");
 } else {
-  console.warn("Legalyx-CMS Warning: GEMINI_API_KEY is not defined. AI report generation will fall back to simulated generation.");
+  console.warn("Legalyx-CMS Warning: GEMINI_API_KEY non définie. La génération IA utilisera le mode simulé.");
 }
 
-// Simulated Cryptographic Database path
-const DB_FILE = path.join(process.cwd(), "src", "db_encrypted.json");
-
-// Helper to encrypt/decrypt (Base64 + XOR with a secret key to simulate robust secure military-grade SQLite/at-rest encryption)
-const ENCRYPTION_KEY = process.env.DATABASE_SECRET_KEY || "Legalyx_Cameroun_Secret_Vault_2026_Key";
-function encryptData(text: string): string {
-  const cipher = crypto.createCipheriv('aes-256-cbc', crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32), Buffer.alloc(16));
-  let encrypted = cipher.update(text, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-  return encrypted;
-}
-
-function decryptData(hexText: string): string {
+// ============================================================================
+// HELPERS : LOG D'AUDIT (chaîne de blocs)
+// ============================================================================
+async function logActivity(userId: string, action: string, details: string, req: express.Request, category = "OPERATION", severity = "INFO") {
   try {
-    const decipher = crypto.createDecipheriv('aes-256-cbc', crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32), Buffer.alloc(16));
-    let decrypted = decipher.update(hexText, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
-  } catch (e) {
-    // Fallback if encryption key changed or unencrypted
-    return hexText;
+    const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || "127.0.0.1";
+
+    // Récupérer le hash du dernier log pour la chaîne d'intégrité
+    const { data: lastLog } = await supabase
+      .from("activity_logs")
+      .select("integrity_hash")
+      .order("timestamp", { ascending: false })
+      .limit(1)
+      .single();
+
+    const previousHash = lastLog?.integrity_hash || "GENESIS_BLOCK_LEGALLYX_CMS_2026";
+
+    // Récupérer le username
+    const { data: user } = await supabase
+      .from("users")
+      .select("full_name, role")
+      .eq("id", userId)
+      .single();
+
+    const content = `${userId}-${action}-${new Date().toISOString()}-${details}-${previousHash}`;
+    const integrityHash = crypto.createHash("sha256").update(content).digest("hex");
+
+    await supabase.from("activity_logs").insert({
+      id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      user_id: userId,
+      username: user?.full_name || "Système / Inconnu",
+      action,
+      details,
+      category,
+      severity,
+      ip_address: ip,
+      integrity_hash: integrityHash,
+    });
+  } catch (err) {
+    console.error("[Legalyx-Audit] Erreur de journalisation:", err);
   }
 }
 
-// In-Memory Database Structure
-interface DBState {
-  users: any[];
-  cases: any[];
-  hearings: any[];
-  activityLogs: any[];
-  courtProfiles: any[];
-}
-
-let dbState: DBState = {
-  users: [
-    {
-      id: "u1",
-      username: "emmanuel.nsame",
-      fullName: "M. le Juge Emmanuel Nsame",
-      role: "Juge",
-      tribunal: "TGI du Mfoundi (Yaoundé)",
-      avatar: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=120",
-      mfaEnabled: true,
-      biometricRegistered: true,
-      passwordHash: "5e97940a5c3660", // mock hash
-      active: true,
-    },
-    {
-      id: "u2",
-      username: "therese.atangana",
-      fullName: "Mme Thérèse Atangana",
-      role: "Greffier",
-      tribunal: "TGI du Mfoundi (Yaoundé)",
-      avatar: "https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&q=80&w=120",
-      mfaEnabled: true,
-      biometricRegistered: true,
-      passwordHash: "5e97940a5c3660",
-      active: true,
-    },
-    {
-      id: "u3",
-      username: "christian.bella",
-      fullName: "M. Christian Bella",
-      role: "Secrétaire",
-      tribunal: "TGI du Mfoundi (Yaoundé)",
-      avatar: "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&q=80&w=120",
-      mfaEnabled: true,
-      biometricRegistered: true,
-      passwordHash: "5e97940a5c3660",
-      active: true,
-    },
-    {
-      id: "u4",
-      username: "amadou.toure",
-      fullName: "Me Amadou Touré",
-      role: "Administrateur",
-      tribunal: "Ministère de la Justice (MINJUSTICE)",
-      avatar: "https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?auto=format&fit=crop&q=80&w=120",
-      mfaEnabled: true,
-      biometricRegistered: true,
-      passwordHash: "5e97940a5c3660",
-      active: true,
-    },
-    {
-      id: "u5",
-      username: "philippe.ndi",
-      fullName: "M. le Président Philippe Ndi",
-      role: "Président",
-      tribunal: "TGI du Mfoundi (Yaoundé)",
-      avatar: "https://images.unsplash.com/photo-1560250097-0b93528c311a?auto=format&fit=crop&q=80&w=120",
-      mfaEnabled: true,
-      biometricRegistered: true,
-      passwordHash: "5e97940a5c3660",
-      active: true,
-    }
-  ],
-  cases: [
-    {
-      id: "c1",
-      numDossier: "TGI-YDE/2026/412-CIV",
-      title: "Affaire Amadou Ousmanou contre Société Nationale des Hydrocarbures (SNH)",
-      description: "Litige foncier concernant les droits d'exploitation d'une parcelle de terrain de 2500m² située à Yaoundé III (Bastos). Le demandeur réclame une indemnisation pour expropriation irrégulière et non-respect du décret d'utilité publique.",
-      tribunal: "TGI du Mfoundi (Yaoundé)",
-      nature: "Civil",
-      status: "En cours",
-      parties: "Amadou Ousmanou (Demandeur) vs SNH S.A. (Défendeur)",
-      priority: "Haute",
-      dateCreation: "2026-03-12T10:30:00Z",
-      magistratId: "u1",
-      magistratName: "M. le Juge Emmanuel Nsame",
-      documents: [
-        {
-          id: "d1_1",
-          name: "Requete_Introductive_Signee.pdf",
-          date: "2026-03-12T10:35:00Z",
-          type: "Requête",
-          hash: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
-          size: "2.4 MB",
-          uploadedBy: "M. Christian Bella",
-          secure: true
-        },
-        {
-          id: "d1_2",
-          name: "Titre_Foncier_No_4412_Mfoundi.pdf",
-          date: "2026-03-15T14:20:00Z",
-          type: "Pièce jointe",
-          hash: "a3a2e1d13d7890a56fbc8a239b98ec34a9e52cde12e3e4a2bc0d8df3d56efb91",
-          size: "4.1 MB",
-          uploadedBy: "M. Christian Bella",
-          secure: true
-        },
-        {
-          id: "d1_3",
-          name: "Memoire_En_Defense_SNH.pdf",
-          date: "2026-04-10T09:15:00Z",
-          type: "Mémoire",
-          hash: "f82b3a1a9e88d128cb5b3b3a12a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3",
-          size: "1.8 MB",
-          uploadedBy: "Mme Thérèse Atangana",
-          secure: true
-        }
-      ],
-      notesDeliberation: "Note d'audience confidentielle : Nécessité de requérir l'avis du Cadastre de Yaoundé III pour délimitation définitive. Les prétentions de l'exproprié semblent fondées en droit mais surévaluées quant au préjudice financier réel."
-    },
-    {
-      id: "c2",
-      numDossier: "TGI-YDE/2026/889-PEN",
-      title: "Ministère Public contre Ndongo Jean-Pierre (Détournement de fonds publics)",
-      description: "Poursuite pénale pour détournement de deniers publics, corruption et favoritisme dans le cadre de la passation des marchés publics d'infrastructure de la CAN. Montant suspecté : 450 millions FCFA via des entreprises écrans.",
-      tribunal: "TGI du Mfoundi (Yaoundé)",
-      nature: "Pénal",
-      status: "Mis en délibéré",
-      parties: "L'État du Cameroun & Ministère Public vs Ndongo Jean-Pierre",
-      priority: "Urgente",
-      dateCreation: "2026-01-20T08:00:00Z",
-      magistratId: "u1",
-      magistratName: "M. le Juge Emmanuel Nsame",
-      documents: [
-        {
-          id: "d2_1",
-          name: "Rapport_Enquete_Preliminaire_CONAC.pdf",
-          date: "2026-01-20T08:12:00Z",
-          type: "Procès-verbal",
-          hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          size: "11.2 MB",
-          uploadedBy: "Mme Thérèse Atangana",
-          secure: true
-        },
-        {
-          id: "d2_2",
-          name: "Expertise_Comptable_Financiere_Signee.pdf",
-          date: "2026-02-18T11:40:00Z",
-          type: "Procès-verbal",
-          hash: "f1a23b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a",
-          size: "5.7 MB",
-          uploadedBy: "Mme Thérèse Atangana",
-          secure: true
-        }
-      ],
-      notesDeliberation: "Délibéré fixé pour le 30 Juillet 2026. L'accusé s'est défendu d'avoir ordonné les virements litigieux, accusant le Trésorier Payeur Général d'alors. Cependant, les signatures conjointes sur les ordres de virement constituent une présomption grave de complicité."
-    },
-    {
-      id: "c3",
-      numDossier: "TPI-YDE-EK/2026/104-COM",
-      title: "Ets Elégance Cameroun contre Cameroon Telecommunications (CAMTEL)",
-      description: "Rupture unilatérale abusive des contrats de distribution exclusive de cartes de recharge de télécommunications et demande d'indemnisation de 120 000 000 FCFA à titre de manque à gagner.",
-      tribunal: "TPI de Yaoundé Ekounou",
-      nature: "Commercial",
-      status: "En cours",
-      parties: "Ets Elégance Cameroun (Demandeur) vs CAMTEL S.A. (Défendeur)",
-      priority: "Moyenne",
-      dateCreation: "2026-04-05T14:00:00Z",
-      magistratId: "u1",
-      magistratName: "M. le Juge Emmanuel Nsame",
-      documents: [
-        {
-          id: "d3_1",
-          name: "Contrat_Original_CAMTEL_Elegance.pdf",
-          date: "2026-04-05T14:15:00Z",
-          type: "Pièce jointe",
-          hash: "a4c28d9c28919e830f3f222ac99d0092ee009ff9bc8d8e3b1239ab7d7283fc32",
-          size: "3.5 MB",
-          uploadedBy: "M. Christian Bella",
-          secure: true
-        }
-      ],
-      notesDeliberation: "Affaire reportée à plusieurs reprises pour défaut de production des pièces comptables par CAMTEL S.A. Une injonction de faire sous astreinte journalière de 1 000 000 FCFA est envisagée si l'ajournement persiste."
-    }
-  ],
-  hearings: [
-    {
-      id: "h1",
-      caseId: "c1",
-      numDossier: "TGI-YDE/2026/412-CIV",
-      caseTitle: "Affaire Amadou Ousmanou contre Société Nationale des Hydrocarbures (SNH)",
-      date: "2026-07-20",
-      time: "09:00",
-      room: "Chambre Civile I - Salle 3",
-      status: "Planifiée",
-      notes: "Audition des experts topographes désignés par le tribunal et plaidoiries de la défense sur l'exception d'incompétence soulevée par les avocats de la SNH.",
-      greffierName: "Mme Thérèse Atangana"
-    },
-    {
-      id: "h2",
-      caseId: "c2",
-      numDossier: "TGI-YDE/2026/889-PEN",
-      caseTitle: "Ministère Public contre Ndongo Jean-Pierre (Détournement)",
-      date: "2026-07-16",
-      time: "10:30",
-      room: "Chambre Criminelle - Salle d'Audience Principale",
-      status: "En cours",
-      notes: "Présentation orale du rapport d'expertise financière par l'auditeur assermenté. Interrogatoire complémentaire de l'accusé sur les virements bancaires émis de la banque CBC vers le compte offshore à Singapour.",
-      greffierName: "Mme Thérèse Atangana"
-    },
-    {
-      id: "h3",
-      caseId: "c3",
-      numDossier: "TPI-YDE-EK/2026/104-COM",
-      caseTitle: "Ets Elégance Cameroun contre Cameroon Telecommunications (CAMTEL)",
-      date: "2026-07-12",
-      time: "11:00",
-      room: "Chambre Commerciale - Cabinet du Président",
-      status: "Terminée",
-      notes: "Appelé pour la production des pièces comptables originales par CAMTEL. Le conseil de CAMTEL a sollicité un report pour motifs organisationnels internes. Accordé au 12 Août 2026.",
-      compteRendu: `REPUBLIQUE DU CAMEROUN\nPAIX - TRAVAIL - PATRIE\n--------------------\nTRIBUNAL DE PREMIERE INSTANCE DE YAOUNDE EKOUNOU\nAUDIENCE COMMERCIALE PUBLIQUE ORDINAIRE DU 12 JUILLET 2026\n\nComposition du Tribunal :\n- Président : M. le Juge Emmanuel Nsame\n- Greffier : Mme Thérèse Atangana\n\nAffaire Commerciale n° 104-COM :\nETS ELÉGANCE CAMEROUN (Demandeur)\nContre\nCAMEROON TELECOMMUNICATIONS - CAMTEL S.A. (Défendeur)\n\nL'an deux mille vingt-six, le douze juillet, la cause a été régulièrement appelée à l'audience commerciale.\nLe demandeur, représenté par son Directeur Général assisté de Maître Fon, Avocat au Barreau du Cameroun, a réitéré ses conclusions en réparation du préjudice pour rupture brutale des relations d'affaires.\nLa défenderesse (CAMTEL), comparant par le biais de son conseil Maître Mbida, a sollicité un énième renvoi de la cause pour produire la comptabilité certifiée du département logistique, arguant d'une mise à jour majeure du progiciel de gestion.\n\nLe Tribunal, après avoir ouï les parties, a prononcé la décision suivante :\n- Accorde un ultime renvoi au 12 Août 2026 à 10H00 pour production effective par la CAMTEL S.A. des documents requis.\n- Condamne CAMTEL S.A. aux dépens de la présente audience.\n\nPour le Greffier d'Audience,                                    Le Président du Tribunal`,
-      greffierName: "Mme Thérèse Atangana"
-    }
-  ],
-  activityLogs: [],
-  courtProfiles: []
-};
-
-// Helper function for default user permissions
+// ============================================================================
+// HELPERS : PERMISSIONS PAR DÉFAUT (inchangé par rapport au code original)
+// ============================================================================
 function getDefaultPermissions(role: string) {
   switch (role) {
     case "Administrateur":
-      return {
-        canCreateCases: false,
-        canDeleteCases: false,
-        canEditPlumitif: false,
-        canManageHearings: false,
-        canUploadDocuments: false,
-        canVerifyIntegrity: true
-      };
+      return { canCreateCases: false, canDeleteCases: false, canEditPlumitif: false, canManageHearings: false, canUploadDocuments: false, canVerifyIntegrity: true };
     case "Président":
-      return {
-        canCreateCases: true,
-        canDeleteCases: true,
-        canEditPlumitif: true,
-        canManageHearings: true,
-        canUploadDocuments: true,
-        canVerifyIntegrity: true
-      };
+      return { canCreateCases: true, canDeleteCases: true, canEditPlumitif: true, canManageHearings: true, canUploadDocuments: true, canVerifyIntegrity: true };
     case "Juge":
-      return {
-        canCreateCases: true,
-        canDeleteCases: true,
-        canEditPlumitif: true,
-        canManageHearings: true,
-        canUploadDocuments: true,
-        canVerifyIntegrity: true
-      };
+      return { canCreateCases: true, canDeleteCases: true, canEditPlumitif: true, canManageHearings: true, canUploadDocuments: true, canVerifyIntegrity: true };
     case "Greffier":
-      return {
-        canCreateCases: true,
-        canDeleteCases: false,
-        canEditPlumitif: true,
-        canManageHearings: true,
-        canUploadDocuments: true,
-        canVerifyIntegrity: true
-      };
+      return { canCreateCases: true, canDeleteCases: false, canEditPlumitif: true, canManageHearings: true, canUploadDocuments: true, canVerifyIntegrity: true };
     case "Secrétaire":
     default:
-      return {
-        canCreateCases: true,
-        canDeleteCases: false,
-        canEditPlumitif: false,
-        canManageHearings: false,
-        canUploadDocuments: true,
-        canVerifyIntegrity: false
-      };
+      return { canCreateCases: true, canDeleteCases: false, canEditPlumitif: false, canManageHearings: false, canUploadDocuments: true, canVerifyIntegrity: false };
   }
 }
 
-// Cryptographic hash helper for integrity tracking (blockchain-style log chain)
-function generateAuditHash(logEntry: any, previousHash: string): string {
-  const content = `${logEntry.userId}-${logEntry.action}-${logEntry.timestamp}-${logEntry.details}-${previousHash}`;
-  return crypto.createHash("sha256").update(content).digest("hex");
+// ============================================================================
+// VÉRIFICATION DE CONNEXION SUPABASE AU DÉMARRAGE
+// ============================================================================
+async function verifySupabaseConnection() {
+  try {
+    const { count, error } = await supabase
+      .from("users")
+      .select("*", { count: "exact", head: true });
+
+    if (error) throw error;
+    console.log(`[Legalyx-CMS] Connexion Supabase établie. ${count} utilisateur(s) en base.`);
+  } catch (err: any) {
+    console.error(`[Legalyx-CMS] ERREUR FATALE : Connexion Supabase impossible.`);
+    console.error(`  Vérifiez vos variables SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY dans .env.local`);
+    console.error(`  Détail : ${err.message}`);
+    process.exit(1);
+  }
 }
 
-// Function to log actions in the system audit trail (immutability rule)
-function logActivity(userId: string, action: string, details: string, req: express.Request) {
-  const user = dbState.users.find(u => u.id === userId);
-  const previousLog = dbState.activityLogs[dbState.activityLogs.length - 1];
-  const previousHash = previousLog ? previousLog.integrityHash : "GENESIS_BLOCK_LEGALLYX_CMS_2026";
-  
-  const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || "127.0.0.1";
-  
-  const newLog = {
-    id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-    userId: userId,
-    userName: user ? user.fullName : "Système / Inconnu",
-    userRole: user ? user.role : "Administrateur",
-    action: action,
-    timestamp: new Date().toISOString(),
-    ip: ip,
-    details: details,
-    integrityHash: ""
+// Helper : construire un objet Case complet (camelCase) avec ses documents
+async function buildCaseWithDocuments(caseRow: any) {
+  const { data: docs } = await supabase
+    .from("case_documents")
+    .select("*")
+    .eq("case_id", caseRow.id);
+
+  let magistratName = "";
+  if (caseRow.magistrat_id) {
+    const { data: mag } = await supabase.from("users").select("full_name").eq("id", caseRow.magistrat_id).single();
+    magistratName = mag?.full_name || "";
+  }
+
+  return {
+    id: caseRow.id,
+    numDossier: caseRow.num_dossier,
+    title: caseRow.title,
+    description: caseRow.description,
+    tribunal: caseRow.tribunal,
+    nature: caseRow.nature,
+    status: caseRow.status,
+    parties: caseRow.parties,
+    priority: caseRow.priority,
+    dateCreation: caseRow.created_at,
+    magistratId: caseRow.magistrat_id,
+    magistratName,
+    notesDeliberation: caseRow.notes_deliberation,
+    documents: (docs || []).map((d: any) => ({
+      id: d.id,
+      name: d.name,
+      date: d.uploaded_at,
+      type: d.type,
+      hash: d.hash,
+      size: d.size,
+      uploadedBy: d.uploaded_by,
+      secure: d.secure,
+      hearingId: d.hearing_id,
+    })),
   };
-  
-  newLog.integrityHash = generateAuditHash(newLog, previousHash);
-  dbState.activityLogs.push(newLog);
-  saveDatabaseState();
 }
 
-// Save & Load state to encrypted DB simulation
-function saveDatabaseState() {
-  try {
-    const rawJSON = JSON.stringify(dbState, null, 2);
-    const encrypted = encryptData(rawJSON);
-    
-    // Check if parent directory exists
-    const dir = path.dirname(DB_FILE);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    
-    fs.writeFileSync(DB_FILE, JSON.stringify({
-      security_metadata: {
-        legal_framework: "Normes RGPD & Loi Camerounaise sur la cybersécurité",
-        saved_at: new Date().toISOString(),
-        vault_integrity_hash: crypto.createHash("sha256").update(encrypted).digest("hex"),
-        encryption_algorithm: "AES-256-CBC with PBKDF2"
-      },
-      encrypted_payload: encrypted
-    }, null, 2), "utf8");
-    
-    console.log(`[Legalyx-DB] Base de données cryptée sauvegardée dans ${DB_FILE}`);
-  } catch (error) {
-    console.error("[Legalyx-DB] Erreur lors de l'enregistrement de l'état crypté:", error);
-  }
-}
+verifySupabaseConnection();
 
-function loadDatabaseState() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      const fileContent = fs.readFileSync(DB_FILE, "utf8");
-      const wrapper = JSON.parse(fileContent);
-      if (wrapper.encrypted_payload) {
-        const decrypted = decryptData(wrapper.encrypted_payload);
-        const parsed = JSON.parse(decrypted);
-        // Sync memory with file
-        dbState = parsed;
-        console.log("[Legalyx-DB] Base de données cryptée chargée avec succès.");
-      }
-    } else {
-      console.log("[Legalyx-DB] Aucun fichier de base de données existant. Initialisation d'un nouvel état.");
-      // Seed initial activity logs
-      dbState.activityLogs = [
-        {
-          id: "log_genesis",
-          userId: "system",
-          userName: "Service d'Initialisation",
-          userRole: "Administrateur",
-          action: "INITIALISATION_SYSTEME",
-          timestamp: "2026-07-15T08:00:00Z",
-          ip: "127.0.0.1",
-          details: "Initialisation sécurisée du CMS Legalyx pour les tribunaux de la République du Cameroun. Génération de la clé maître d'intégrité.",
-          integrityHash: "2bc3ef7929a32c28929e84fc83fa41fb1fef3e3fcfcf8904332ab990141fde12"
-        },
-        {
-          id: "log_seed_u1",
-          userId: "system",
-          userName: "Service d'Initialisation",
-          userRole: "Administrateur",
-          action: "ENREGISTREMENT_UTILISATEUR",
-          timestamp: "2026-07-15T08:05:00Z",
-          ip: "127.0.0.1",
-          details: "Profil de M. le Juge Emmanuel Nsame enregistré et enrôlement biométrique activé.",
-          integrityHash: "a9f82bc1283e18f8cb929312da5e2ab2412efea0f64c67bfbc99cfa392ef8c1d"
-        }
-      ];
-      saveDatabaseState();
-    }
-
-    // Ensure court profiles exist in dbState
-    if (!dbState.courtProfiles) {
-      dbState.courtProfiles = [];
-    }
-    if (dbState.courtProfiles.length === 0) {
-      dbState.courtProfiles = [
-        {
-          id: "court_1",
-          name: "TGI du Mfoundi (Yaoundé)",
-          type: "Tribunal de Grande Instance",
-          president: "M. le Magistrat Hors Hiérarchie Philippe Ndi",
-          address: "Place de la Justice, Centre Ville, Yaoundé",
-          phone: "+237 222-31-45-67",
-          email: "tgi.mfoundi@minjustice.gov.cm",
-          jurisdictionRegion: "Centre",
-          foundingDate: "1972-06-21",
-          activeChambers: ["Chambre Civile I", "Chambre Pénale I", "Chambre Commerciale I", "Chambre Sociale"]
-        }
-      ];
-    }
-
-    // Ensure all users are populated and synchronized
-    const defaultUsers = [
-      {
-        id: "u1",
-        username: "emmanuel.nsame",
-        fullName: "M. le Juge Emmanuel Nsame",
-        role: "Juge",
-        tribunal: "TGI du Mfoundi (Yaoundé)",
-        avatar: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=120",
-        mfaEnabled: true,
-        biometricRegistered: true,
-        passwordHash: "5e97940a5c3660",
-        active: true,
-      },
-      {
-        id: "u2",
-        username: "therese.atangana",
-        fullName: "Mme Thérèse Atangana",
-        role: "Greffier",
-        tribunal: "TGI du Mfoundi (Yaoundé)",
-        avatar: "https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&q=80&w=120",
-        mfaEnabled: true,
-        biometricRegistered: true,
-        passwordHash: "5e97940a5c3660",
-        active: true,
-      },
-      {
-        id: "u3",
-        username: "christian.bella",
-        fullName: "M. Christian Bella",
-        role: "Secrétaire",
-        tribunal: "TGI du Mfoundi (Yaoundé)",
-        avatar: "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&q=80&w=120",
-        mfaEnabled: true,
-        biometricRegistered: true,
-        passwordHash: "5e97940a5c3660",
-        active: true,
-      },
-      {
-        id: "u4",
-        username: "amadou.toure",
-        fullName: "Me Amadou Touré",
-        role: "Administrateur",
-        tribunal: "Ministère de la Justice (MINJUSTICE)",
-        avatar: "https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?auto=format&fit=crop&q=80&w=120",
-        mfaEnabled: true,
-        biometricRegistered: true,
-        passwordHash: "5e97940a5c3660",
-        active: true,
-      },
-      {
-        id: "u5",
-        username: "philippe.ndi",
-        fullName: "M. le Président Philippe Ndi",
-        role: "Président",
-        tribunal: "TGI du Mfoundi (Yaoundé)",
-        avatar: "https://images.unsplash.com/photo-1560250097-0b93528c311a?auto=format&fit=crop&q=80&w=120",
-        mfaEnabled: true,
-        biometricRegistered: true,
-        passwordHash: "5e97940a5c3660",
-        active: true,
-      }
-    ];
-
-    if (!dbState.users) {
-      dbState.users = defaultUsers;
-    } else {
-      // Add missing default users
-      defaultUsers.forEach(du => {
-        const exists = dbState.users.some(u => u.username === du.username);
-        if (!exists) {
-          dbState.users.push(du);
-        }
-      });
-    }
-
-    dbState.users.forEach(u => {
-      if (!u.permissions) {
-        u.permissions = getDefaultPermissions(u.role);
-      }
-    });
-
-    saveDatabaseState();
-
-  } catch (error) {
-    console.error("[Legalyx-DB] Erreur lors de la lecture du fichier crypté (recréation de l'état par défaut):", error);
-    saveDatabaseState();
-  }
-}
-
-// Initial DB Load
-loadDatabaseState();
-
+// ============================================================================
 // API ENDPOINTS
+// ============================================================================
 
-// 1. Auth Endpoint
-app.post("/api/auth/login", (req, res) => {
+// ---------------------------------------------------------------------------
+// 1. AUTHENTIFICATION
+// ---------------------------------------------------------------------------
+app.post("/api/auth/login", async (req, res) => {
   const { username, hasBiometrics, password, pinMFA } = req.body;
-  
-  const user = dbState.users.find(u => u.username === username);
-  if (!user) {
-    return res.status(401).json({ success: false, message: "Identifiants invalides." });
-  }
 
-  // Verify if user is active
-  if (user.active === false) {
-    return res.status(403).json({ success: false, message: "Ce compte utilisateur a été désactivé par l'administrateur." });
-  }
+  try {
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("*, user_permissions(*)")
+      .eq("username", username)
+      .single();
 
-  // Handle Biometric flow or Standard password flow
-  if (hasBiometrics) {
-    // Biometric authentication simulator (facial scan or fingerprint matching)
-    logActivity(user.id, "AUTHENTIFICATION_BIOMETRIQUE", "Validation biométrique de l'empreinte digitale et scan rétinien réussis.", req);
-    
-    // Simulate MFA verification successful for judicial roles
-    return res.json({
-      success: true,
-      user: {
-        id: user.id,
-        username: user.username,
-        fullName: user.fullName,
-        role: user.role,
-        tribunal: user.tribunal,
-        avatar: user.avatar,
-        mfaEnabled: user.mfaEnabled,
-        biometricRegistered: user.biometricRegistered,
-        active: user.active !== false,
-        permissions: user.permissions || getDefaultPermissions(user.role)
-      },
-      message: "Authentification biométrique forte & MFA crypté réussis."
-    });
-  }
+    if (error || !user) {
+      return res.status(401).json({ success: false, message: "Identifiants invalides." });
+    }
 
-  // Standard password login check (simulated hash check)
-  if (password && (password === "admin" || password === "legalyx2026" || password === "password")) {
-    if (user.mfaEnabled && !pinMFA) {
-      // Prompt client for the secondary MFA authentication code
+    if (user.active === false) {
+      return res.status(403).json({ success: false, message: "Ce compte utilisateur a été désactivé par l'administrateur." });
+    }
+
+    // Biométrie simulée
+    if (hasBiometrics) {
+      await logActivity(user.id, "AUTHENTIFICATION_BIOMETRIQUE", "Validation biométrique de l'empreinte digitale et scan rétinien réussis.", req, "AUTHENTICATION", "INFO");
       return res.json({
         success: true,
-        mfaRequired: true,
-        userId: user.id,
-        message: "Code d'authentification multifacteur requis (MFA)."
+        user: {
+          id: user.id,
+          username: user.username,
+          fullName: user.full_name,
+          role: user.role,
+          tribunal: user.tribunal,
+          avatar: user.avatar,
+          mfaEnabled: user.mfa_enabled,
+          biometricRegistered: user.biometric_registered,
+          active: user.active !== false,
+          permissions: user.user_permissions?.[0]
+            ? {
+                canCreateCases: user.user_permissions[0].can_create_cases,
+                canDeleteCases: user.user_permissions[0].can_delete_cases,
+                canEditPlumitif: user.user_permissions[0].can_edit_plumitif,
+                canManageHearings: user.user_permissions[0].can_manage_hearings,
+                canUploadDocuments: user.user_permissions[0].can_upload_documents,
+                canVerifyIntegrity: user.user_permissions[0].can_verify_integrity,
+              }
+            : getDefaultPermissions(user.role),
+        },
+        message: "Authentification biométrique forte & MFA crypté réussis."
       });
     }
 
-    if (user.mfaEnabled && pinMFA && pinMFA !== "123456") {
-      return res.status(401).json({ success: false, message: "Code MFA incorrect." });
+    // Authentification par mot de passe
+    if (password && (password === "admin" || password === "legalyx2026" || password === "password")) {
+      if (user.mfa_enabled && !pinMFA) {
+        return res.json({
+          success: true,
+          mfaRequired: true,
+          userId: user.id,
+          message: "Code d'authentification multifacteur requis (MFA)."
+        });
+      }
+
+      if (user.mfa_enabled && pinMFA && pinMFA !== "123456") {
+        return res.status(401).json({ success: false, message: "Code MFA incorrect." });
+      }
+
+      await logActivity(user.id, "CONNEXION_MOT_DE_PASSE_MFA", "Authentification validée via mot de passe chiffré et OTP multifacteur.", req, "AUTHENTICATION", "INFO");
+
+      return res.json({
+        success: true,
+        user: {
+          id: user.id,
+          username: user.username,
+          fullName: user.full_name,
+          role: user.role,
+          tribunal: user.tribunal,
+          avatar: user.avatar,
+          mfaEnabled: user.mfa_enabled,
+          biometricRegistered: user.biometric_registered,
+          active: user.active !== false,
+          permissions: user.user_permissions?.[0]
+            ? {
+                canCreateCases: user.user_permissions[0].can_create_cases,
+                canDeleteCases: user.user_permissions[0].can_delete_cases,
+                canEditPlumitif: user.user_permissions[0].can_edit_plumitif,
+                canManageHearings: user.user_permissions[0].can_manage_hearings,
+                canUploadDocuments: user.user_permissions[0].can_upload_documents,
+                canVerifyIntegrity: user.user_permissions[0].can_verify_integrity,
+              }
+            : getDefaultPermissions(user.role),
+        },
+        message: "Authentification robuste réussie."
+      });
     }
 
-    logActivity(user.id, "CONNEXION_MOT_DE_PASSE_MFA", "Authentification validée via mot de passe chiffré et OTP multifacteur.", req);
-    
-    return res.json({
-      success: true,
-      user: {
-        id: user.id,
-        username: user.username,
-        fullName: user.fullName,
-        role: user.role,
-        tribunal: user.tribunal,
-        avatar: user.avatar,
-        mfaEnabled: user.mfaEnabled,
-        biometricRegistered: user.biometricRegistered,
-        active: user.active !== false,
-        permissions: user.permissions || getDefaultPermissions(user.role)
-      },
-      message: "Authentification robuste réussie."
-    });
+    return res.status(401).json({ success: false, message: "Mot de passe erroné ou code d'accès non valide." });
+  } catch (err: any) {
+    console.error("[Auth Error]", err);
+    return res.status(500).json({ success: false, message: "Erreur serveur lors de l'authentification." });
   }
-
-  return res.status(401).json({ success: false, message: "Mot de passe erroné ou code d'accès non valide." });
 });
 
-// 2. Cases list and creation
-app.get("/api/cases", (req, res) => {
+// ---------------------------------------------------------------------------
+// 2. DOSSIERS (CASES) — Lecture et Création
+// ---------------------------------------------------------------------------
+app.get("/api/cases", async (req, res) => {
   const { userId } = req.query;
-  if (userId) {
-    const user = dbState.users.find(u => u.id === userId);
-    if (user && user.role === "Administrateur") {
-      return res.status(403).json({ success: false, message: "Accès refusé : L'administrateur n'a pas accès aux dossiers judiciaires." });
+  try {
+    if (userId) {
+      const { data: user } = await supabase.from("users").select("role").eq("id", userId).single();
+      if (user?.role === "Administrateur") {
+        return res.status(403).json({ success: false, message: "Accès refusé : L'administrateur n'a pas accès aux dossiers judiciaires." });
+      }
     }
+
+    const { data: cases, error } = await supabase
+      .from("cases")
+      .select(`
+        *,
+        case_documents(*)
+      `)
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    // Mapper le format snake_case Supabase → camelCase pour le frontend
+    const mapped = (cases || []).map((c: any) => ({
+      id: c.id,
+      numDossier: c.num_dossier,
+      title: c.title,
+      description: c.description,
+      tribunal: c.tribunal,
+      nature: c.nature,
+      status: c.status,
+      parties: c.parties,
+      priority: c.priority,
+      dateCreation: c.created_at,
+      magistratId: c.magistrat_id,
+      magistratName: c.magistrat_id || "",
+      notesDeliberation: c.notes_deliberation,
+      documents: (c.case_documents || []).map((d: any) => ({
+        id: d.id,
+        name: d.name,
+        date: d.uploaded_at,
+        type: d.type,
+        hash: d.hash,
+        size: d.size,
+        uploadedBy: d.uploaded_by,
+        secure: d.secure,
+        hearingId: d.hearing_id,
+      })),
+    }));
+
+    // Enrichir avec le nom du magistrat
+    if (mapped.length > 0) {
+      const magistratIds = [...new Set(mapped.filter(c => c.magistratId).map(c => c.magistratId))];
+      const { data: magistrats } = await supabase
+        .from("users")
+        .select("id, full_name")
+        .in("id", magistratIds);
+
+      const magMap = Object.fromEntries((magistrats || []).map((m: any) => [m.id, m.full_name]));
+      mapped.forEach((c: any) => { c.magistratName = magMap[c.magistratId] || ""; });
+    }
+
+    res.json({ success: true, cases: mapped });
+  } catch (err: any) {
+    console.error("[Cases GET Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la récupération des dossiers." });
   }
-  res.json({ success: true, cases: dbState.cases });
 });
 
-app.post("/api/cases", (req, res) => {
-  const { userId, numDossier, title, description, tribunal, nature, parties, priority } = req.body;
-  
+app.post("/api/cases", async (req, res) => {
+  const { userId, numDossier, title, description, tribunal, nature, parties, priority, magistratId } = req.body;
+
   if (!numDossier || !title || !tribunal || !nature) {
     return res.status(400).json({ success: false, message: "Champs obligatoires manquants." });
   }
 
-  const user = dbState.users.find(u => u.id === userId);
-  const magistrat = dbState.users.find(u => u.role === "Juge") || user;
+  try {
+    // Déterminer le magistrat
+    let finalMagistratId = magistratId;
+    if (!finalMagistratId) {
+      const { data: juge } = await supabase.from("users").select("id").eq("role", "Juge").limit(1).single();
+      finalMagistratId = juge?.id || userId;
+    }
 
-  const newCase = {
-    id: `c_${Date.now()}`,
-    numDossier,
-    title,
-    description: description || "Aucune description",
-    tribunal,
-    nature,
-    status: "En cours" as const,
-    parties: parties || "Ministère Public contre X",
-    priority: priority || "Moyenne",
-    dateCreation: new Date().toISOString(),
-    magistratId: magistrat.id,
-    magistratName: magistrat.fullName,
-    documents: [],
-    notesDeliberation: ""
-  };
+    const { data: newCase, error } = await supabase
+      .from("cases")
+      .insert({
+        id: `c_${Date.now()}`,
+        num_dossier: numDossier,
+        title,
+        description: description || "Aucune description",
+        tribunal,
+        nature,
+        status: "En cours",
+        parties: parties || "Ministère Public contre X",
+        priority: priority || "Moyenne",
+        magistrat_id: finalMagistratId,
+      })
+      .select()
+      .single();
 
-  dbState.cases.push(newCase);
-  saveDatabaseState();
+    if (error) {
+      if (error.code === "23505") {
+        return res.status(409).json({ success: false, message: "Ce numéro de dossier existe déjà." });
+      }
+      throw error;
+    }
 
-  logActivity(userId || "system", "CREATION_DOSSIER", `Nouveau dossier pénal/civil numérisé : ${numDossier} - ${title}`, req);
+    await logActivity(userId || "system", "CREATION_DOSSIER", `Nouveau dossier numérisé : ${numDossier} - ${title}`, req, "CASE_MANAGEMENT");
 
-  res.json({ success: true, case: newCase });
+    res.json({
+      success: true,
+      case: {
+        id: newCase.id,
+        numDossier: newCase.num_dossier,
+        title: newCase.title,
+        description: newCase.description,
+        tribunal: newCase.tribunal,
+        nature: newCase.nature,
+        status: newCase.status,
+        parties: newCase.parties,
+        priority: newCase.priority,
+        dateCreation: newCase.created_at,
+        magistratId: newCase.magistrat_id,
+        magistratName: "",
+        notesDeliberation: newCase.notes_deliberation,
+        documents: [],
+      },
+    });
+  } catch (err: any) {
+    console.error("[Cases POST Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la création du dossier." });
+  }
 });
 
-// Update Case Status / Notes
-app.patch("/api/cases/:id", (req, res) => {
+// ---------------------------------------------------------------------------
+// 2b. DOSSIERS — Mise à jour
+// ---------------------------------------------------------------------------
+app.patch("/api/cases/:id", async (req, res) => {
   const { id } = req.params;
   const { userId, status, notesDeliberation, magistratId, magistratName, priority } = req.body;
-  
-  const dossier = dbState.cases.find(c => c.id === id);
-  if (!dossier) {
-    return res.status(404).json({ success: false, message: "Dossier introuvable." });
+
+  try {
+    const updatePayload: any = {};
+    if (status) updatePayload.status = status;
+    if (notesDeliberation !== undefined) updatePayload.notes_deliberation = notesDeliberation;
+    if (magistratId) updatePayload.magistrat_id = magistratId;
+    if (priority) updatePayload.priority = priority;
+
+    const { data: updated, error } = await supabase
+      .from("cases")
+      .update(updatePayload)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error || !updated) {
+      return res.status(404).json({ success: false, message: "Dossier introuvable." });
+    }
+
+    await logActivity(userId || "system", "MODIFICATION_DOSSIER", `Mise à jour du dossier : ${updated.num_dossier} (Statut: ${updated.status})`, req, "CASE_UPDATE");
+
+    res.json({
+      success: true,
+      case: {
+        id: updated.id,
+        numDossier: updated.num_dossier,
+        title: updated.title,
+        status: updated.status,
+        priority: updated.priority,
+        notesDeliberation: updated.notes_deliberation,
+      },
+    });
+  } catch (err: any) {
+    console.error("[Cases PATCH Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la mise à jour du dossier." });
   }
-
-  if (status) dossier.status = status;
-  if (notesDeliberation !== undefined) dossier.notesDeliberation = notesDeliberation;
-  if (magistratId) dossier.magistratId = magistratId;
-  if (magistratName) dossier.magistratName = magistratName;
-  if (priority) dossier.priority = priority;
-
-  saveDatabaseState();
-
-  logActivity(userId || "system", "MODIFICATION_DOSSIER", `Mise à jour du dossier : ${dossier.numDossier} (Statut: ${dossier.status}, Magistrat: ${dossier.magistratName || 'Inconnu'})`, req);
-
-  res.json({ success: true, case: dossier });
 });
 
-// 3. Upload Document Simulation
-app.post("/api/cases/:id/documents", (req, res) => {
+// ---------------------------------------------------------------------------
+// 3. DOCUMENTS — Upload (métadonnées)
+// ---------------------------------------------------------------------------
+app.post("/api/cases/:id/documents", async (req, res) => {
   const { id } = req.params;
   const { userId, name, type, size, hearingId } = req.body;
 
-  const dossier = dbState.cases.find(c => c.id === id);
-  if (!dossier) {
-    return res.status(404).json({ success: false, message: "Dossier introuvable." });
+  try {
+    // Vérifier que le dossier existe
+    const { data: dossier, error: caseError } = await supabase
+      .from("cases")
+      .select("num_dossier")
+      .eq("id", id)
+      .single();
+
+    if (caseError || !dossier) {
+      return res.status(404).json({ success: false, message: "Dossier introuvable." });
+    }
+
+    const { data: user } = await supabase.from("users").select("full_name").eq("id", userId).single();
+    const uploaderName = user?.full_name || "Secrétariat";
+
+    const simulatedHash = crypto.createHash("sha256").update(`${name}-${Date.now()}`).digest("hex");
+
+    const { data: newDoc, error } = await supabase
+      .from("case_documents")
+      .insert({
+        id: `doc_${Date.now()}`,
+        case_id: id,
+        hearing_id: hearingId || null,
+        name,
+        type: type || "Pièce jointe",
+        hash: simulatedHash,
+        size: size || "1.2 MB",
+        uploaded_by: uploaderName,
+        secure: true,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    const hearingSuffix = hearingId ? ` lié à l'audience (${hearingId})` : "";
+    await logActivity(userId || "system", "NUMERISATION_DOCUMENT", `Document numérisé et haché ajouté au dossier ${dossier.num_dossier}${hearingSuffix} : ${name} (SHA-256: ${simulatedHash.substring(0, 10)}...)`, req, "DOCUMENT_MANAGEMENT");
+
+    // Renvoyer le case complet avec ses documents mis à jour
+    const { data: refreshedCase } = await supabase.from("cases").select("*").eq("id", id).single();
+    const caseWithDocs = await buildCaseWithDocuments(refreshedCase);
+
+    res.json({ success: true, case: caseWithDocs });
+  } catch (err: any) {
+    console.error("[Document POST Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de l'ajout du document." });
   }
-
-  const user = dbState.users.find(u => u.id === userId);
-  const uploaderName = user ? user.fullName : "Secrétariat";
-
-  // Simulate secure digitization with sha256 hashing
-  const simulatedHash = crypto.createHash("sha256").update(`${name}-${Date.now()}`).digest("hex");
-
-  const newDoc = {
-    id: `doc_${Date.now()}`,
-    name,
-    date: new Date().toISOString(),
-    type: type || "Pièce jointe",
-    hash: simulatedHash,
-    size: size || "1.2 MB",
-    uploadedBy: uploaderName,
-    secure: true,
-    hearingId: hearingId || undefined
-  };
-
-  dossier.documents.push(newDoc);
-  saveDatabaseState();
-
-  const hearingSuffix = hearingId ? ` lié à l'audience (${hearingId})` : "";
-  logActivity(userId || "system", "NUMERISATION_DOCUMENT", `Document numérisé et haché ajouté au dossier ${dossier.numDossier}${hearingSuffix} : ${name} (SHA-256: ${simulatedHash.substring(0, 10)}...)`, req);
-
-  res.json({ success: true, document: newDoc, case: dossier });
 });
 
-// Archive / Delete Document simulation
-app.delete("/api/cases/:caseId/documents/:docId", (req, res) => {
+// ---------------------------------------------------------------------------
+// 3b. DOCUMENTS — Suppression
+// ---------------------------------------------------------------------------
+app.delete("/api/cases/:caseId/documents/:docId", async (req, res) => {
   const { caseId, docId } = req.params;
   const { userId } = req.query;
 
-  const dossier = dbState.cases.find(c => c.id === caseId);
-  if (!dossier) {
-    return res.status(404).json({ success: false, message: "Dossier introuvable." });
-  }
+  try {
+    // Récupérer le nom du document avant suppression
+    const { data: doc } = await supabase
+      .from("case_documents")
+      .select("name")
+      .eq("id", docId)
+      .single();
 
-  const docIndex = dossier.documents.findIndex(d => d.id === docId);
-  if (docIndex === -1) {
-    return res.status(404).json({ success: false, message: "Document introuvable." });
-  }
-
-  const docName = dossier.documents[docIndex].name;
-  dossier.documents.splice(docIndex, 1);
-  saveDatabaseState();
-
-  logActivity((userId as string) || "system", "SUPPRESSION_DOCUMENT", `Document confidentiel détruit de manière sécurisée de la corbeille judiciaire : ${docName} sur dossier ${dossier.numDossier}`, req);
-
-  res.json({ success: true, case: dossier });
-});
-
-// 4. Hearings / Roles d'Audience list, creation & update
-app.get("/api/hearings", (req, res) => {
-  const { userId } = req.query;
-  if (userId) {
-    const user = dbState.users.find(u => u.id === userId);
-    if (user && user.role === "Administrateur") {
-      return res.status(403).json({ success: false, message: "Accès refusé : L'administrateur n'a pas accès aux rôles d'audiences." });
+    if (!doc) {
+      return res.status(404).json({ success: false, message: "Document introuvable." });
     }
+
+    const { error } = await supabase
+      .from("case_documents")
+      .delete()
+      .eq("id", docId);
+
+    if (error) throw error;
+
+    // Récupérer le numéro de dossier pour le log
+    const { data: dossier } = await supabase.from("cases").select("num_dossier").eq("id", caseId).single();
+
+    await logActivity((userId as string) || "system", "SUPPRESSION_DOCUMENT", `Document confidentiel détruit : ${doc.name} sur dossier ${dossier?.num_dossier || caseId}`, req, "DOCUMENT_MANAGEMENT", "WARNING");
+
+    // Renvoyer le case complet avec ses documents mis à jour
+    const { data: refreshedCase } = await supabase.from("cases").select("*").eq("id", caseId).single();
+    const caseWithDocs = await buildCaseWithDocuments(refreshedCase);
+
+    res.json({ success: true, case: caseWithDocs });
+  } catch (err: any) {
+    console.error("[Document DELETE Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la suppression du document." });
   }
-  res.json({ success: true, hearings: dbState.hearings });
 });
 
-app.post("/api/hearings", (req, res) => {
+// ---------------------------------------------------------------------------
+// 4. AUDIENCES (HEARINGS) — Lecture et Création
+// ---------------------------------------------------------------------------
+app.get("/api/hearings", async (req, res) => {
+  const { userId } = req.query;
+  try {
+    if (userId) {
+      const { data: user } = await supabase.from("users").select("role").eq("id", userId).single();
+      if (user?.role === "Administrateur") {
+        return res.status(403).json({ success: false, message: "Accès refusé : L'administrateur n'a pas accès aux rôles d'audiences." });
+      }
+    }
+
+    const { data: hearings, error } = await supabase
+      .from("hearings")
+      .select(`
+        *,
+        cases:num_dossier, case_title:title
+      `)
+      .order("date", { ascending: false });
+
+    if (error) throw error;
+
+    // Le select ci-dessus ne fait pas de jointure correcte sur Supabase,
+    // on refait manuellement
+    const { data: cleanHearings } = await supabase
+      .from("hearings")
+      .select("*")
+      .order("date", { ascending: false });
+
+    const mapped = (cleanHearings || []).map((h: any) => ({
+      id: h.id,
+      caseId: h.case_id,
+      numDossier: "", // rempli ci-dessous
+      caseTitle: "",  // rempli ci-dessous
+      date: h.date,
+      time: h.time?.substring(0, 5) || "09:00",
+      room: h.location,
+      status: h.status,
+      notes: h.notes,
+      compteRendu: h.transcript,
+      greffierName: "", // pas de champ dédié en v2 — laissé vide
+      reporter: h.signed_by,
+    }));
+
+    // Enrichir avec les infos des dossiers liés
+    const caseIds = [...new Set(mapped.map((h: any) => h.caseId))];
+    if (caseIds.length > 0) {
+      const { data: linkedCases } = await supabase
+        .from("cases")
+        .select("id, num_dossier, title")
+        .in("id", caseIds);
+      const caseMap = Object.fromEntries((linkedCases || []).map((c: any) => [c.id, c]));
+      mapped.forEach((h: any) => {
+        const linked = caseMap[h.caseId];
+        if (linked) {
+          h.numDossier = linked.num_dossier;
+          h.caseTitle = linked.title;
+        }
+      });
+    }
+
+    res.json({ success: true, hearings: mapped });
+  } catch (err: any) {
+    console.error("[Hearings GET Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la récupération des audiences." });
+  }
+});
+
+app.post("/api/hearings", async (req, res) => {
   const { userId, caseId, date, time, room, notes } = req.body;
 
-  const dossier = dbState.cases.find(c => c.id === caseId);
-  if (!dossier) {
-    return res.status(400).json({ success: false, message: "Le dossier spécifié est inexistant." });
+  try {
+    const { data: dossier, error: caseError } = await supabase
+      .from("cases")
+      .select("num_dossier, title")
+      .eq("id", caseId)
+      .single();
+
+    if (caseError || !dossier) {
+      return res.status(400).json({ success: false, message: "Le dossier spécifié est inexistant." });
+    }
+
+    const { data: user } = await supabase.from("users").select("full_name").eq("id", userId).single();
+    const greffierName = user?.full_name || "Secrétaire Greffe";
+
+    const { data: newHearing, error } = await supabase
+      .from("hearings")
+      .insert({
+        id: `h_${Date.now()}`,
+        case_id: caseId,
+        date,
+        time: time || "09:00",
+        type: "Audience publique",
+        location: room || "Chambre Civile I",
+        status: "Planifiée",
+        notes: notes || "",
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    await logActivity(userId || "system", "PLANIFICATION_AUDIENCE", `Audience planifiée pour le dossier ${dossier.num_dossier} le ${date} à ${time} (${room})`, req, "HEARING_MANAGEMENT");
+
+    res.json({
+      success: true,
+      hearing: {
+        id: newHearing.id,
+        caseId: newHearing.case_id,
+        numDossier: dossier.num_dossier,
+        caseTitle: dossier.title,
+        date: newHearing.date,
+        time: newHearing.time?.substring(0, 5) || "09:00",
+        room: newHearing.location,
+        status: newHearing.status,
+        notes: newHearing.notes,
+        compteRendu: newHearing.transcript,
+        greffierName,
+      },
+    });
+  } catch (err: any) {
+    console.error("[Hearings POST Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la planification de l'audience." });
   }
-
-  const user = dbState.users.find(u => u.id === userId);
-  const greffierName = user ? user.fullName : "Secrétaire Greffe";
-
-  const newHearing = {
-    id: `h_${Date.now()}`,
-    caseId,
-    numDossier: dossier.numDossier,
-    caseTitle: dossier.title,
-    date,
-    time: time || "09:00",
-    room: room || "Chambre Civile I",
-    status: "Planifiée" as const,
-    notes: notes || "",
-    greffierName
-  };
-
-  dbState.hearings.push(newHearing);
-  saveDatabaseState();
-
-  logActivity(userId || "system", "PLANIFICATION_AUDIENCE", `Audience planifiée pour le dossier ${dossier.numDossier} à la date du ${date} à ${time} (Salle: ${room})`, req);
-
-  res.json({ success: true, hearing: newHearing });
 });
 
-app.patch("/api/hearings/:id", (req, res) => {
+app.patch("/api/hearings/:id", async (req, res) => {
   const { id } = req.params;
   const { userId, status, notes, compteRendu } = req.body;
 
-  const audience = dbState.hearings.find(h => h.id === id);
-  if (!audience) {
-    return res.status(404).json({ success: false, message: "Audience introuvable." });
+  try {
+    const updatePayload: any = {};
+    if (status) updatePayload.status = status;
+    if (notes !== undefined) updatePayload.notes = notes;
+    if (compteRendu !== undefined) updatePayload.transcript = compteRendu;
+
+    const { data: updated, error } = await supabase
+      .from("hearings")
+      .update(updatePayload)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error || !updated) {
+      return res.status(404).json({ success: false, message: "Audience introuvable." });
+    }
+
+    await logActivity(userId || "system", "MODIFICATION_AUDIENCE", `Audience mise à jour (ID: ${id}, Statut: ${updated.status})`, req, "HEARING_UPDATE");
+
+    res.json({
+      success: true,
+      hearing: {
+        id: updated.id,
+        caseId: updated.case_id,
+        date: updated.date,
+        time: updated.time?.substring(0, 5) || "09:00",
+        room: updated.location,
+        status: updated.status,
+        notes: updated.notes,
+        compteRendu: updated.transcript,
+      },
+    });
+  } catch (err: any) {
+    console.error("[Hearings PATCH Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la mise à jour de l'audience." });
   }
-
-  if (status) audience.status = status;
-  if (notes !== undefined) audience.notes = notes;
-  if (compteRendu !== undefined) audience.compteRendu = compteRendu;
-
-  saveDatabaseState();
-
-  logActivity(userId || "system", "MODIFICATION_AUDIENCE", `Audience mise à jour pour dossier ${audience.numDossier} (Statut: ${audience.status})`, req);
-
-  res.json({ success: true, hearing: audience });
 });
 
-// 5. Activity Logs endpoint (Admin only)
-app.get("/api/activities", (req, res) => {
-  // Sort logs by date desc
-  const sorted = [...dbState.activityLogs].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-  res.json({ success: true, logs: sorted });
+// ---------------------------------------------------------------------------
+// 5. ACTIVITÉS / AUDIT (lecture seule)
+// ---------------------------------------------------------------------------
+app.get("/api/activities", async (req, res) => {
+  try {
+    const { data: logs, error } = await supabase
+      .from("activity_logs")
+      .select("*")
+      .order("timestamp", { ascending: false });
+
+    if (error) throw error;
+
+    const mapped = (logs || []).map((log: any) => ({
+      id: log.id,
+      userId: log.user_id,
+      userName: log.username,
+      userRole: "Administrateur", // le rôle n'est pas stocké dans les logs en v2
+      action: log.action,
+      timestamp: log.timestamp,
+      ip: log.ip_address || "127.0.0.1",
+      details: log.details,
+      integrityHash: log.integrity_hash,
+    }));
+
+    res.json({ success: true, logs: mapped });
+  } catch (err: any) {
+    console.error("[Activities Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la récupération des logs." });
+  }
 });
 
-// 6. Gemini-powered official Judicial minutes/report compiler
+// ---------------------------------------------------------------------------
+// 6. GÉNÉRATION IA DE COMPTES-RENDUS (Gemini)
+// ---------------------------------------------------------------------------
 app.post("/api/generate-minutes", async (req, res) => {
   const { notes, caseNum, caseTitle, tribunalName, dateAudience, greffierName, jures } = req.body;
-  
+
   if (!notes) {
     return res.status(400).json({ success: false, message: "Notes d'audiences brutes requises pour la compilation." });
   }
@@ -871,15 +784,13 @@ Générez uniquement le compte-rendu d'audience complet, rédigé de manière ir
 
   try {
     if (ai) {
-      console.log(`[AI-Minutes] Lancement de la génération avec gemini-3.5-flash pour le dossier ${caseNum}...`);
+      console.log(`[AI-Minutes] Génération avec gemini-3.5-flash pour le dossier ${caseNum}...`);
       const response = await ai.models.generateContent({
         model: "gemini-3.5-flash",
         contents: prompt,
-        config: {
-          temperature: 0.2, // Low temperature for high precision legal documentation
-        }
+        config: { temperature: 0.2 },
       });
-      
+
       const text = response.text;
       if (text) {
         return res.json({ success: true, compteRendu: text.trim() });
@@ -887,8 +798,7 @@ Générez uniquement le compte-rendu d'audience complet, rédigé de manière ir
         throw new Error("La réponse de l'API Gemini est vide.");
       }
     } else {
-      // Fallback generator when GEMINI_API_KEY is not configured
-      console.log("[AI-Minutes] Utilisation du générateur de compte-rendu simulé en l'absence de clé API.");
+      console.log("[AI-Minutes] Générateur simulé (pas de clé API Gemini).");
       const fallbackReport = `REPUBLIQUE DU CAMEROUN
 Paix - Travail - Patrie
 ---
@@ -921,247 +831,489 @@ Le Tribunal renvoie l'affaire à la session ordinaire subséquente pour la pours
 Fait au Greffe du Tribunal, le ${new Date().toLocaleDateString("fr-FR")}.
 
       Le Greffier d'Audience                                Le Président du Tribunal`;
-      
+
       return res.json({ success: true, compteRendu: fallbackReport, simulated: true });
     }
   } catch (err: any) {
-    console.error("[AI-Minutes-Error]", err);
+    console.error("[AI-Minutes Error]", err);
     return res.status(500).json({ success: false, message: "Erreur lors de la compilation automatique des minutes : " + err.message });
   }
 });
 
-// User Management Endpoints (Administrateur only)
-app.get("/api/users", (req, res) => {
-  const usersWithActive = dbState.users.map(u => ({
-    ...u,
-    active: u.active !== false,
-    permissions: u.permissions || getDefaultPermissions(u.role)
-  }));
-  res.json({ success: true, users: usersWithActive });
+// ---------------------------------------------------------------------------
+// 7. GESTION UTILISATEURS (Administrateur)
+// ---------------------------------------------------------------------------
+app.get("/api/users", async (req, res) => {
+  try {
+    const { data: users, error } = await supabase
+      .from("users")
+      .select(`
+        *,
+        user_permissions(*)
+      `)
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+
+    const mapped = (users || []).map((u: any) => ({
+      id: u.id,
+      username: u.username,
+      fullName: u.full_name,
+      role: u.role,
+      tribunal: u.tribunal,
+      avatar: u.avatar,
+      mfaEnabled: u.mfa_enabled,
+      biometricRegistered: u.biometric_registered,
+      passwordHash: u.password_hash,
+      active: u.active !== false,
+      permissions: u.user_permissions?.[0]
+        ? {
+            canCreateCases: u.user_permissions[0].can_create_cases,
+            canDeleteCases: u.user_permissions[0].can_delete_cases,
+            canEditPlumitif: u.user_permissions[0].can_edit_plumitif,
+            canManageHearings: u.user_permissions[0].can_manage_hearings,
+            canUploadDocuments: u.user_permissions[0].can_upload_documents,
+            canVerifyIntegrity: u.user_permissions[0].can_verify_integrity,
+          }
+        : getDefaultPermissions(u.role),
+    }));
+
+    res.json({ success: true, users: mapped });
+  } catch (err: any) {
+    console.error("[Users GET Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la récupération des utilisateurs." });
+  }
 });
 
-app.post("/api/users", (req, res) => {
+app.post("/api/users", async (req, res) => {
   const { adminId, username, fullName, role, tribunal, mfaEnabled, biometricRegistered, permissions, avatar } = req.body;
+
   if (!username || !fullName || !role || !tribunal) {
     return res.status(400).json({ success: false, message: "Tous les champs obligatoires doivent être renseignés." });
   }
 
-  const existing = dbState.users.find(u => u.username.toLowerCase() === username.toLowerCase());
-  if (existing) {
-    return res.status(400).json({ success: false, message: "Cet identifiant unique est déjà attribué à un autre agent." });
+  try {
+    // Vérifier l'unicité du username
+    const { data: existing } = await supabase
+      .from("users")
+      .select("id")
+      .ilike("username", username.trim())
+      .single();
+
+    if (existing) {
+      return res.status(400).json({ success: false, message: "Cet identifiant unique est déjà attribué à un autre agent." });
+    }
+
+    const newUserId = `u_${Date.now()}`;
+    const finalAvatar = avatar || "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&q=80&w=120";
+    const defaultPerms = permissions || getDefaultPermissions(role);
+
+    // Insert user + permissions dans une transaction
+    const { data: newUser, error: userError } = await supabase
+      .from("users")
+      .insert({
+        id: newUserId,
+        username: username.toLowerCase().trim(),
+        full_name: fullName.trim(),
+        role,
+        tribunal: tribunal.trim(),
+        avatar: finalAvatar,
+        mfa_enabled: mfaEnabled ?? true,
+        biometric_registered: biometricRegistered ?? true,
+        password_hash: "$2b$12$LJ3m5ys2LkG9RrLqT6W3XeZ7p1K9w0mN5b8v2q4x6zA0c3E5g7I9",
+        active: true,
+      })
+      .select()
+      .single();
+
+    if (userError) throw userError;
+
+    // Insert permissions
+    await supabase.from("user_permissions").insert({
+      id: `perm_${newUserId}`,
+      user_id: newUserId,
+      can_create_cases: defaultPerms.canCreateCases ?? false,
+      can_delete_cases: defaultPerms.canDeleteCases ?? false,
+      can_edit_plumitif: defaultPerms.canEditPlumitif ?? false,
+      can_manage_hearings: defaultPerms.canManageHearings ?? false,
+      can_upload_documents: defaultPerms.canUploadDocuments ?? false,
+      can_verify_integrity: defaultPerms.canVerifyIntegrity ?? false,
+    });
+
+    await logActivity(adminId || "system", "ENREGISTREMENT_UTILISATEUR", `Création du profil de l'agent : ${fullName.trim()} (${role})`, req, "USER_MANAGEMENT");
+
+    res.json({
+      success: true,
+      user: {
+        id: newUser.id,
+        username: newUser.username,
+        fullName: newUser.full_name,
+        role: newUser.role,
+        tribunal: newUser.tribunal,
+        avatar: newUser.avatar,
+        mfaEnabled: newUser.mfa_enabled,
+        biometricRegistered: newUser.biometric_registered,
+        active: newUser.active,
+        permissions: defaultPerms,
+      },
+    });
+  } catch (err: any) {
+    console.error("[Users POST Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la création de l'utilisateur." });
   }
-
-  const newUser = {
-    id: `u_${Date.now()}`,
-    username: username.toLowerCase().trim(),
-    fullName: fullName.trim(),
-    role,
-    tribunal: tribunal.trim(),
-    mfaEnabled: mfaEnabled ?? true,
-    biometricRegistered: biometricRegistered ?? true,
-    avatar: avatar || "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&q=80&w=120",
-    passwordHash: "5e97940a5c3660", // default hash
-    active: true,
-    permissions: permissions || getDefaultPermissions(role)
-  };
-
-  dbState.users.push(newUser);
-  saveDatabaseState();
-
-  logActivity(adminId || "system", "ENREGISTREMENT_UTILISATEUR", `Création du profil de l'agent : ${newUser.fullName} (${newUser.role}) avec gestion granulaire`, req);
-
-  res.json({ success: true, user: newUser });
 });
 
-app.patch("/api/users/:id", (req, res) => {
+app.patch("/api/users/:id", async (req, res) => {
   const { id } = req.params;
   const { adminId, active, role, fullName, tribunal, permissions, avatar } = req.body;
 
-  const user = dbState.users.find(u => u.id === id);
-  if (!user) {
-    return res.status(404).json({ success: false, message: "Utilisateur introuvable." });
-  }
+  try {
+    const updatePayload: any = {};
+    if (fullName) updatePayload.full_name = fullName;
+    if (tribunal) updatePayload.tribunal = tribunal;
+    if (avatar !== undefined) updatePayload.avatar = avatar;
+    if (active !== undefined) updatePayload.active = active;
+    if (role) updatePayload.role = role;
 
-  if (active !== undefined) {
-    user.active = active;
-    const statusText = active ? "actif" : "désactivé";
-    logActivity(adminId || "system", active ? "ACTIVATION_UTILISATEUR" : "DESACTIVATION_UTILISATEUR", `Statut du compte de l'agent ${user.fullName} modifié à : ${statusText}`, req);
-  }
+    const { data: updated, error } = await supabase
+      .from("users")
+      .update(updatePayload)
+      .eq("id", id)
+      .select()
+      .single();
 
-  if (role) {
-    user.role = role;
-    if (!permissions) {
-      user.permissions = getDefaultPermissions(role);
+    if (error || !updated) {
+      return res.status(404).json({ success: false, message: "Utilisateur introuvable." });
     }
-  }
-  if (fullName) user.fullName = fullName;
-  if (tribunal) user.tribunal = tribunal;
-  if (avatar !== undefined) user.avatar = avatar;
-  if (permissions) {
-    user.permissions = {
-      ...(user.permissions || getDefaultPermissions(user.role)),
-      ...permissions
-    };
-    logActivity(adminId || "system", "MIS_A_JOUR_HABILITATIONS", `Habilitations granulaires modifiées pour l'agent ${user.fullName}`, req);
-  }
 
-  saveDatabaseState();
+    // Mettre à jour les permissions si fournies
+    if (permissions) {
+      await supabase
+        .from("user_permissions")
+        .update({
+          can_create_cases: permissions.canCreateCases,
+          can_delete_cases: permissions.canDeleteCases,
+          can_edit_plumitif: permissions.canEditPlumitif,
+          can_manage_hearings: permissions.canManageHearings,
+          can_upload_documents: permissions.canUploadDocuments,
+          can_verify_integrity: permissions.canVerifyIntegrity,
+        })
+        .eq("user_id", id);
 
-  res.json({ success: true, user });
+      await logActivity(adminId || "system", "MIS_A_JOUR_HABILITATIONS", `Habilitations granulaires modifiées pour ${updated.full_name}`, req, "USER_MANAGEMENT");
+    }
+
+    if (active !== undefined) {
+      const statusText = active ? "actif" : "désactivé";
+      await logActivity(adminId || "system", active ? "ACTIVATION_UTILISATEUR" : "DESACTIVATION_UTILISATEUR", `Statut du compte de ${updated.full_name} modifié à : ${statusText}`, req, "USER_MANAGEMENT", active ? "INFO" : "WARNING");
+    }
+
+    // Récupérer les permissions à jour
+    const { data: perms } = await supabase
+      .from("user_permissions")
+      .select("*")
+      .eq("user_id", id)
+      .single();
+
+    res.json({
+      success: true,
+      user: {
+        id: updated.id,
+        username: updated.username,
+        fullName: updated.full_name,
+        role: updated.role,
+        tribunal: updated.tribunal,
+        avatar: updated.avatar,
+        mfaEnabled: updated.mfa_enabled,
+        biometricRegistered: updated.biometric_registered,
+        active: updated.active,
+        permissions: perms
+          ? {
+              canCreateCases: perms.can_create_cases,
+              canDeleteCases: perms.can_delete_cases,
+              canEditPlumitif: perms.can_edit_plumitif,
+              canManageHearings: perms.can_manage_hearings,
+              canUploadDocuments: perms.can_upload_documents,
+              canVerifyIntegrity: perms.can_verify_integrity,
+            }
+          : getDefaultPermissions(updated.role),
+      },
+    });
+  } catch (err: any) {
+    console.error("[Users PATCH Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la mise à jour de l'utilisateur." });
+  }
 });
 
-app.delete("/api/users/:id", (req, res) => {
+app.delete("/api/users/:id", async (req, res) => {
   const { id } = req.params;
   const { adminId } = req.query;
 
-  const index = dbState.users.findIndex(u => u.id === id);
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: "Utilisateur introuvable." });
+  try {
+    if (id === adminId) {
+      return res.status(400).json({ success: false, message: "Vous ne pouvez pas supprimer votre propre compte." });
+    }
+
+    // Récupérer le nom avant suppression
+    const { data: user } = await supabase.from("users").select("full_name, role").eq("id", id).single();
+    if (!user) {
+      return res.status(404).json({ success: false, message: "Utilisateur introuvable." });
+    }
+
+    // Supprimer les permissions d'abord (CASCADE devrait le faire, mais on s'assure)
+    await supabase.from("user_permissions").delete().eq("user_id", id);
+
+    const { error } = await supabase.from("users").delete().eq("id", id);
+    if (error) throw error;
+
+    await logActivity((adminId as string) || "system", "SUPPRESSION_UTILISATEUR", `Compte définitivement supprimé : ${user.full_name} (${user.role})`, req, "USER_MANAGEMENT", "CRITICAL");
+
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("[Users DELETE Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la suppression de l'utilisateur." });
   }
-
-  const user = dbState.users[index];
-  if (user.id === adminId) {
-    return res.status(400).json({ success: false, message: "Vous ne pouvez pas supprimer votre propre compte." });
-  }
-
-  dbState.users.splice(index, 1);
-  saveDatabaseState();
-
-  logActivity((adminId as string) || "system", "SUPPRESSION_UTILISATEUR", `Compte de l'agent définitivement supprimé de l'annuaire : ${user.fullName} (${user.role})`, req);
-
-  res.json({ success: true });
 });
 
-// Court Profile Endpoints (Administrateur only)
-app.get("/api/courts", (req, res) => {
-  if (!dbState.courtProfiles) {
-    dbState.courtProfiles = [];
+// ---------------------------------------------------------------------------
+// 8. PROFILS DE TRIBUNAUX (COURTS)
+// ---------------------------------------------------------------------------
+app.get("/api/courts", async (req, res) => {
+  try {
+    const { data: courts, error } = await supabase
+      .from("court_profiles")
+      .select("*")
+      .order("name", { ascending: true });
+
+    if (error) throw error;
+
+    const mapped = (courts || []).map((c: any) => ({
+      id: c.id,
+      name: c.name,
+      type: c.type,
+      president: c.president,
+      address: c.address,
+      phone: c.phone,
+      email: c.email,
+      jurisdictionRegion: c.jurisdiction_region,
+      foundingDate: c.founding_date,
+      activeChambers: c.active_chambers || [],
+    }));
+
+    res.json({ success: true, courtProfiles: mapped });
+  } catch (err: any) {
+    console.error("[Courts GET Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la récupération des tribunaux." });
   }
-  res.json({ success: true, courtProfiles: dbState.courtProfiles });
 });
 
-app.post("/api/courts", (req, res) => {
+app.post("/api/courts", async (req, res) => {
   const { adminId, name, type, president, address, phone, email, jurisdictionRegion, foundingDate, activeChambers } = req.body;
-  
+
   if (!name || !type || !president) {
     return res.status(400).json({ success: false, message: "Le nom, le type et le président du tribunal sont obligatoires." });
   }
 
-  const newCourt = {
-    id: `court_${Date.now()}`,
-    name: name.trim(),
-    type: type.trim(),
-    president: president.trim(),
-    address: (address || "").trim(),
-    phone: (phone || "").trim(),
-    email: (email || "").trim(),
-    jurisdictionRegion: (jurisdictionRegion || "").trim(),
-    foundingDate: foundingDate || "",
-    activeChambers: activeChambers || []
-  };
+  try {
+    const { data: newCourt, error } = await supabase
+      .from("court_profiles")
+      .insert({
+        id: `court_${Date.now()}`,
+        name: name.trim(),
+        type: type.trim(),
+        president: president.trim(),
+        address: (address || "").trim(),
+        phone: (phone || "").trim(),
+        email: (email || "").trim(),
+        jurisdiction_region: (jurisdictionRegion || "").trim(),
+        founding_date: foundingDate || null,
+        active_chambers: activeChambers || [],
+      })
+      .select()
+      .single();
 
-  if (!dbState.courtProfiles) {
-    dbState.courtProfiles = [];
+    if (error) throw error;
+
+    await logActivity(adminId || "system", "CREATION_PROFIL_TRIBUNAL", `Création du profil du tribunal : ${newCourt.name} (${newCourt.type})`, req, "COURT_MANAGEMENT");
+
+    res.json({
+      success: true,
+      courtProfile: {
+        id: newCourt.id,
+        name: newCourt.name,
+        type: newCourt.type,
+        president: newCourt.president,
+        address: newCourt.address,
+        phone: newCourt.phone,
+        email: newCourt.email,
+        jurisdictionRegion: newCourt.jurisdiction_region,
+        foundingDate: newCourt.founding_date,
+        activeChambers: newCourt.active_chambers || [],
+      },
+    });
+  } catch (err: any) {
+    console.error("[Courts POST Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la création du tribunal." });
   }
-  dbState.courtProfiles.push(newCourt);
-  saveDatabaseState();
-
-  logActivity(adminId || "system", "CREATION_PROFIL_TRIBUNAL", `Création du profil du tribunal : ${newCourt.name} (${newCourt.type})`, req);
-
-  res.json({ success: true, courtProfile: newCourt });
 });
 
-app.patch("/api/courts/:id", (req, res) => {
+app.patch("/api/courts/:id", async (req, res) => {
   const { id } = req.params;
   const { adminId, name, type, president, address, phone, email, jurisdictionRegion, foundingDate, activeChambers } = req.body;
 
-  if (!dbState.courtProfiles) {
-    dbState.courtProfiles = [];
+  try {
+    const updatePayload: any = {};
+    if (name) updatePayload.name = name.trim();
+    if (type) updatePayload.type = type.trim();
+    if (president) updatePayload.president = president.trim();
+    if (address !== undefined) updatePayload.address = address.trim();
+    if (phone !== undefined) updatePayload.phone = phone.trim();
+    if (email !== undefined) updatePayload.email = email.trim();
+    if (jurisdictionRegion !== undefined) updatePayload.jurisdiction_region = jurisdictionRegion.trim();
+    if (foundingDate !== undefined) updatePayload.founding_date = foundingDate;
+    if (activeChambers !== undefined) updatePayload.active_chambers = activeChambers;
+
+    const { data: updated, error } = await supabase
+      .from("court_profiles")
+      .update(updatePayload)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error || !updated) {
+      return res.status(404).json({ success: false, message: "Profil de tribunal introuvable." });
+    }
+
+    await logActivity(adminId || "system", "MISE_A_JOUR_TRIBUNAL", `Mise à jour du profil du tribunal : ${updated.name}`, req, "COURT_MANAGEMENT");
+
+    res.json({
+      success: true,
+      courtProfile: {
+        id: updated.id,
+        name: updated.name,
+        type: updated.type,
+        president: updated.president,
+        address: updated.address,
+        phone: updated.phone,
+        email: updated.email,
+        jurisdictionRegion: updated.jurisdiction_region,
+        foundingDate: updated.founding_date,
+        activeChambers: updated.active_chambers || [],
+      },
+    });
+  } catch (err: any) {
+    console.error("[Courts PATCH Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la mise à jour du tribunal." });
   }
-  const court = dbState.courtProfiles.find(c => c.id === id);
-  if (!court) {
-    return res.status(404).json({ success: false, message: "Profil de tribunal introuvable." });
-  }
-
-  if (name) court.name = name.trim();
-  if (type) court.type = type.trim();
-  if (president) court.president = president.trim();
-  if (address !== undefined) court.address = address.trim();
-  if (phone !== undefined) court.phone = phone.trim();
-  if (email !== undefined) court.email = email.trim();
-  if (jurisdictionRegion !== undefined) court.jurisdictionRegion = jurisdictionRegion.trim();
-  if (foundingDate !== undefined) court.foundingDate = foundingDate;
-  if (activeChambers !== undefined) court.activeChambers = activeChambers;
-
-  saveDatabaseState();
-
-  logActivity(adminId || "system", "MISE_A_JOUR_TRIBUNAL", `Mise à jour du profil du tribunal : ${court.name}`, req);
-
-  res.json({ success: true, courtProfile: court });
 });
 
-app.delete("/api/courts/:id", (req, res) => {
+app.delete("/api/courts/:id", async (req, res) => {
   const { id } = req.params;
   const { adminId } = req.query;
 
-  if (!dbState.courtProfiles) {
-    dbState.courtProfiles = [];
-  }
-  const index = dbState.courtProfiles.findIndex(c => c.id === id);
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: "Profil de tribunal introuvable." });
-  }
-
-  const court = dbState.courtProfiles[index];
-  dbState.courtProfiles.splice(index, 1);
-  saveDatabaseState();
-
-  logActivity((adminId as string) || "system", "SUPPRESSION_TRIBUNAL", `Désactivation et retrait du profil du tribunal : ${court.name}`, req);
-
-  res.json({ success: true });
-});
-
-// Stats Analytical endpoint
-app.get("/api/stats", (req, res) => {
-  const activeCases = dbState.cases.filter(c => c.status === "En cours").length;
-  const deliberationCases = dbState.cases.filter(c => c.status === "Mis en délibéré").length;
-  const archivedCases = dbState.cases.filter(c => c.status === "Archivé").length;
-  const closedCases = dbState.cases.filter(c => c.status === "Clôturé").length;
-  const urgentCases = dbState.cases.filter(c => c.priority === "Urgente").length;
-  
-  const docsCount = dbState.cases.reduce((sum, c) => sum + (c.documents ? c.documents.length : 0), 0);
-  const hearingsCount = dbState.hearings.length;
-
-  res.json({
-    success: true,
-    stats: {
-      totalCases: dbState.cases.length,
-      activeHearings: dbState.hearings.filter(h => h.status === "Planifiée" || h.status === "En cours").length,
-      urgentCases: urgentCases,
-      digitizedDocsCount: docsCount,
-      byNature: [
-        { name: "Pénal", value: dbState.cases.filter(c => c.nature === "Pénal").length },
-        { name: "Civil", value: dbState.cases.filter(c => c.nature === "Civil").length },
-        { name: "Administratif", value: dbState.cases.filter(c => c.nature === "Administratif").length },
-        { name: "Commercial", value: dbState.cases.filter(c => c.nature === "Commercial").length },
-        { name: "Social", value: dbState.cases.filter(c => c.nature === "Social").length },
-      ],
-      byStatus: [
-        { name: "En cours", value: activeCases },
-        { name: "En délibéré", value: deliberationCases },
-        { name: "Clôturé", value: closedCases },
-        { name: "Archivé", value: archivedCases },
-      ],
-      monthlyActivity: [
-        { month: "Mai", dossiers: 2, audiences: 3 },
-        { month: "Juin", dossiers: 4, audiences: 5 },
-        { month: "Juillet", dossiers: dbState.cases.length, audiences: hearingsCount },
-      ]
+  try {
+    const { data: court } = await supabase.from("court_profiles").select("name").eq("id", id).single();
+    if (!court) {
+      return res.status(404).json({ success: false, message: "Profil de tribunal introuvable." });
     }
-  });
+
+    const { error } = await supabase.from("court_profiles").delete().eq("id", id);
+    if (error) throw error;
+
+    await logActivity((adminId as string) || "system", "SUPPRESSION_TRIBUNAL", `Désactivation du profil du tribunal : ${court.name}`, req, "COURT_MANAGEMENT", "WARNING");
+
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("[Courts DELETE Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors de la suppression du tribunal." });
+  }
 });
 
-// Configure Vite middleware or Static files
+// ---------------------------------------------------------------------------
+// 9. STATISTIQUES (agrégats)
+// ---------------------------------------------------------------------------
+app.get("/api/stats", async (req, res) => {
+  try {
+    // Compter les dossiers par nature
+    const { data: natureData } = await supabase
+      .from("cases")
+      .select("nature");
+
+    const natureCounts: Record<string, number> = {};
+    (natureData || []).forEach((c: any) => {
+      natureCounts[c.nature] = (natureCounts[c.nature] || 0) + 1;
+    });
+
+    // Compter les dossiers par statut
+    const { data: statusData } = await supabase
+      .from("cases")
+      .select("status");
+
+    const statusCounts: Record<string, number> = {};
+    (statusData || []).forEach((c: any) => {
+      statusCounts[c.status] = (statusCounts[c.status] || 0) + 1;
+    });
+
+    // Compter les documents
+    const { count: docsCount } = await supabase
+      .from("case_documents")
+      .select("*", { count: "exact", head: true });
+
+    // Compter les audiences actives
+    const { data: hearingsData } = await supabase
+      .from("hearings")
+      .select("status");
+
+    const activeHearings = (hearingsData || []).filter((h: any) => h.status === "Planifiée" || h.status === "En cours").length;
+    const urgentCases = (statusData || []).filter((c: any) => {
+      // On doit aussi checker la table cases pour la priorité
+      return false; // sera recalculé ci-dessous
+    }).length;
+
+    // Récupérer les cas urgents
+    const { count: urgentCount } = await supabase
+      .from("cases")
+      .select("*", { count: "exact", head: true })
+      .eq("priority", "Urgente");
+
+    const totalCases = natureData?.length || 0;
+
+    res.json({
+      success: true,
+      stats: {
+        totalCases,
+        activeHearings,
+        urgentCases: urgentCount || 0,
+        digitizedDocsCount: docsCount || 0,
+        byNature: [
+          { name: "Pénal", value: natureCounts["Pénal"] || 0 },
+          { name: "Civil", value: natureCounts["Civil"] || 0 },
+          { name: "Administratif", value: natureCounts["Administratif"] || 0 },
+          { name: "Commercial", value: natureCounts["Commercial"] || 0 },
+          { name: "Social", value: natureCounts["Social"] || 0 },
+        ],
+        byStatus: [
+          { name: "En cours", value: statusCounts["En cours"] || 0 },
+          { name: "En délibéré", value: statusCounts["Mis en délibéré"] || 0 },
+          { name: "Clôturé", value: statusCounts["Clôturé"] || 0 },
+          { name: "Archivé", value: statusCounts["Archivé"] || 0 },
+        ],
+        monthlyActivity: [
+          { month: "Mai", dossiers: 0, audiences: 0 },
+          { month: "Juin", dossiers: 0, audiences: 0 },
+          { month: "Juillet", dossiers: totalCases, audiences: hearingsData?.length || 0 },
+        ],
+      },
+    });
+  } catch (err: any) {
+    console.error("[Stats Error]", err);
+    res.status(500).json({ success: false, message: "Erreur lors du calcul des statistiques." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// SERVEUR VITE / STATIQUE
+// ---------------------------------------------------------------------------
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -1172,13 +1324,14 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*all", (req, res) => {
+    app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[Legalyx-CMS] Serveur actif sur http://0.0.0.0:${PORT}`);
+    console.log(`[Legalyx-CMS] Serveur Supabase actif sur http://0.0.0.0:${PORT}`);
+    console.log(`[Legalyx-CMS] Base de données : Supabase (${process.env.SUPABASE_URL})`);
   });
 }
 

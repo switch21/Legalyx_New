@@ -6,6 +6,8 @@ import {
   Calendar, MapPin, Paperclip, History
 } from "lucide-react";
 import { motion } from "motion/react";
+import supabase from "../lib/supabaseClient";
+import { mapCaseFromDb, logActivity } from "../lib/helpers";
 
 interface CasesTabProps {
   cases: Case[];
@@ -53,30 +55,47 @@ export default function CasesTab({ cases, hearings, currentUser, onRefreshCases 
     if (!numDossier || !title) return;
 
     try {
-      const response = await fetch("/api/cases", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          numDossier,
+      // Déterminer le magistrat par défaut
+      let finalMagistratId = currentUser.id;
+      if (currentUser.role === 'Secrétaire' || currentUser.role === 'Greffier') {
+        const { data: juge } = await supabase.from('users').select('id').eq('role', 'Juge').limit(1).single();
+        finalMagistratId = juge?.id || currentUser.id;
+      }
+
+      const { data: newCase, error } = await supabase
+        .from('cases')
+        .insert({
+          id: `c_${Date.now()}`,
+          num_dossier: numDossier,
           title,
-          description,
+          description: description || 'Aucune description',
           tribunal,
           nature,
-          parties,
-          priority
+          status: 'En cours',
+          parties: parties || 'Ministère Public contre X',
+          priority: priority || 'Moyenne',
+          magistrat_id: finalMagistratId,
         })
-      });
+        .select()
+        .single();
 
-      const data = await response.json();
-      if (data.success) {
-        setShowAddForm(false);
-        setNumDossier("");
-        setTitle("");
-        setParties("");
-        setDescription("");
-        onRefreshCases();
+      if (error) {
+        if (error.code === '23505') {
+          alert('Ce numéro de dossier existe déjà.');
+        } else {
+          console.error(error);
+        }
+        return;
       }
+
+      await logActivity(currentUser.id, 'CREATION_DOSSIER', `Nouveau dossier numérisé : ${numDossier} - ${title}`);
+
+      setShowAddForm(false);
+      setNumDossier("");
+      setTitle("");
+      setParties("");
+      setDescription("");
+      onRefreshCases();
     } catch (err) {
       console.error(err);
     }
@@ -86,19 +105,21 @@ export default function CasesTab({ cases, hearings, currentUser, onRefreshCases 
     if (!selectedCase) return;
     setSavingNotes(true);
     try {
-      const response = await fetch(`/api/cases/${selectedCase.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          notesDeliberation
-        })
-      });
-      const data = await response.json();
-      if (data.success) {
-        setSelectedCase(data.case);
-        onRefreshCases();
-      }
+      const { data: updated, error } = await supabase
+        .from('cases')
+        .update({ notes_deliberation: notesDeliberation })
+        .eq('id', selectedCase.id)
+        .select()
+        .single();
+
+      if (error) { console.error(error); return; }
+
+      // Rebuild the case object locally
+      const { data: docs } = await supabase.from('case_documents').select('*').eq('case_id', selectedCase.id);
+      const mapped = mapCaseFromDb(updated, docs || [], selectedCase.magistratName);
+      setSelectedCase(mapped);
+      await logActivity(currentUser.id, 'MODIFICATION_DOSSIER', `Notes de délibération mises à jour pour le dossier ${updated.num_dossier}`);
+      onRefreshCases();
     } catch (e) {
       console.error(e);
     } finally {
@@ -109,19 +130,20 @@ export default function CasesTab({ cases, hearings, currentUser, onRefreshCases 
   const handleUpdateStatus = async (newStatus: Case["status"]) => {
     if (!selectedCase) return;
     try {
-      const response = await fetch(`/api/cases/${selectedCase.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          status: newStatus
-        })
-      });
-      const data = await response.json();
-      if (data.success) {
-        setSelectedCase(data.case);
-        onRefreshCases();
-      }
+      const { data: updated, error } = await supabase
+        .from('cases')
+        .update({ status: newStatus })
+        .eq('id', selectedCase.id)
+        .select()
+        .single();
+
+      if (error) { console.error(error); return; }
+
+      const { data: docs } = await supabase.from('case_documents').select('*').eq('case_id', selectedCase.id);
+      const mapped = mapCaseFromDb(updated, docs || [], selectedCase.magistratName);
+      setSelectedCase(mapped);
+      await logActivity(currentUser.id, 'MODIFICATION_DOSSIER', `Statut du dossier ${updated.num_dossier} changé en : ${newStatus}`);
+      onRefreshCases();
     } catch (e) {
       console.error(e);
     }
@@ -167,27 +189,45 @@ export default function CasesTab({ cases, hearings, currentUser, onRefreshCases 
     if (!selectedCase) return;
     setUploading(true);
     
-    // Simulate uploading a judicial document with client-side info
     const simulatedSize = `${(file.size / (1024 * 1024)).toFixed(2)} MB`;
     
     try {
-      const response = await fetch(`/api/cases/${selectedCase.id}/documents`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
+      // Générer un hash SHA-256 simulé
+      const content = `${file.name}-${Date.now()}`;
+      const encoder = new TextEncoder();
+      const dataBuf = encoder.encode(content);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', dataBuf);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const simulatedHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+      const { data: newDoc, error } = await supabase
+        .from('case_documents')
+        .insert({
+          id: `doc_${Date.now()}`,
+          case_id: selectedCase.id,
+          hearing_id: hearingId || null,
           name: file.name,
           type: getFileType(file.name),
+          hash: simulatedHash,
           size: simulatedSize,
-          hearingId: hearingId || undefined
+          uploaded_by: currentUser.fullName,
+          secure: true,
         })
-      });
+        .select()
+        .single();
 
-      const data = await response.json();
-      if (data.success) {
-        setSelectedCase(data.case);
-        onRefreshCases();
+      if (error) { console.error(error); return; }
+
+      const hearingSuffix = hearingId ? ` lié à l'audience (${hearingId})` : '';
+      await logActivity(currentUser.id, 'NUMERISATION_DOCUMENT', `Document numérisé et haché ajouté au dossier ${selectedCase.numDossier}${hearingSuffix} : ${file.name} (SHA-256: ${simulatedHash.substring(0, 10)}...)`);
+
+      // Rebuild case with updated documents
+      const { data: caseRow } = await supabase.from('cases').select('*').eq('id', selectedCase.id).single();
+      const { data: docs } = await supabase.from('case_documents').select('*').eq('case_id', selectedCase.id);
+      if (caseRow) {
+        setSelectedCase(mapCaseFromDb(caseRow, docs || [], selectedCase.magistratName));
       }
+      onRefreshCases();
     } catch (err) {
       console.error(err);
     } finally {
@@ -202,26 +242,29 @@ export default function CasesTab({ cases, hearings, currentUser, onRefreshCases 
     setSchedulingHearing(true);
 
     try {
-      const response = await fetch("/api/hearings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId: currentUser.id,
-          caseId: selectedCase.id,
+      const { data: newHearing, error } = await supabase
+        .from('hearings')
+        .insert({
+          id: `h_${Date.now()}`,
+          case_id: selectedCase.id,
           date: newHearingDate,
-          time: newHearingTime,
-          room: newHearingRoom,
-          notes: newHearingNotes
+          time: newHearingTime || '09:00',
+          type: 'Audience publique',
+          location: newHearingRoom || 'Chambre Civile I',
+          status: 'Planifiée',
+          notes: newHearingNotes || '',
         })
-      });
+        .select()
+        .single();
 
-      const data = await response.json();
-      if (data.success) {
-        setNewHearingDate("");
-        setNewHearingNotes("");
-        setShowAddHearing(false);
-        onRefreshCases();
-      }
+      if (error) { console.error(error); return; }
+
+      await logActivity(currentUser.id, 'PLANIFICATION_AUDIENCE', `Audience planifiée pour le dossier ${selectedCase.numDossier} le ${newHearingDate} à ${newHearingTime} (${newHearingRoom})`);
+
+      setNewHearingDate("");
+      setNewHearingNotes("");
+      setShowAddHearing(false);
+      onRefreshCases();
     } catch (err) {
       console.error(err);
     } finally {
@@ -234,14 +277,22 @@ export default function CasesTab({ cases, hearings, currentUser, onRefreshCases 
     if (!confirm("Voulez-vous supprimer ce document numérisé définitivement ? Cette action sera consignée dans les rapports d'audit de sécurité.")) return;
 
     try {
-      const response = await fetch(`/api/cases/${selectedCase.id}/documents/${docId}?userId=${currentUser.id}`, {
-        method: "DELETE"
-      });
-      const data = await response.json();
-      if (data.success) {
-        setSelectedCase(data.case);
-        onRefreshCases();
+      // Récupérer le nom du document avant suppression
+      const { data: doc } = await supabase.from('case_documents').select('name').eq('id', docId).single();
+      if (!doc) return;
+
+      const { error } = await supabase.from('case_documents').delete().eq('id', docId);
+      if (error) { console.error(error); return; }
+
+      await logActivity(currentUser.id, 'SUPPRESSION_DOCUMENT', `Document confidentiel détruit : ${doc.name} sur dossier ${selectedCase.numDossier}`, 'DOCUMENT_MANAGEMENT', 'WARNING');
+
+      // Rebuild case with updated documents
+      const { data: caseRow } = await supabase.from('cases').select('*').eq('id', selectedCase.id).single();
+      const { data: docs } = await supabase.from('case_documents').select('*').eq('case_id', selectedCase.id);
+      if (caseRow) {
+        setSelectedCase(mapCaseFromDb(caseRow, docs || [], selectedCase.magistratName));
       }
+      onRefreshCases();
     } catch (err) {
       console.error(err);
     }
