@@ -1,25 +1,18 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { User, UserRole, UserPermissions, CourtProfile } from "../types";
 import { 
   Users, UserPlus, Trash2, ShieldCheck, ShieldAlert, 
   Search, CheckCircle, XCircle, RefreshCw, Key, 
   Fingerprint, MapPin, BadgeHelp, Check, X,
-  Building2, Edit3, Layers, Mail, Phone, Calendar as IconCalendar, Shield, PlusCircle
+  Building2, Edit3, Layers, Mail, Phone, Calendar as IconCalendar, Shield, PlusCircle,
+  Camera, Upload, Eye, Lock
 } from "lucide-react";
 import { motion } from "motion/react";
 import supabase from "../lib/supabaseClient";
 import { mapUserFromDb, mapCourtFromDb, getDefaultPermissions, logActivity } from "../lib/helpers";
 
-export const AVATAR_PRESETS = [
-  "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=120",
-  "https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&q=80&w=120",
-  "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&q=80&w=120",
-  "https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?auto=format&fit=crop&q=80&w=120",
-  "https://images.unsplash.com/photo-1560250097-0b93528c311a?auto=format&fit=crop&q=80&w=120",
-  "https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&q=80&w=120",
-  "https://images.unsplash.com/photo-1580489944761-15a19d654956?auto=format&fit=crop&q=80&w=120",
-  "https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&q=80&w=120",
-];
+// Avatar par défaut (silhouette générique)
+export const DEFAULT_AVATAR = ""; // vide = icône rendue côté UI
 
 interface UsersTabProps {
   currentUser: User;
@@ -42,12 +35,21 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
   // New/Edit User form states
   const [fullName, setFullName] = useState("");
   const [username, setUsername] = useState("");
-  const [avatar, setAvatar] = useState(AVATAR_PRESETS[0]);
+  const [avatar, setAvatar] = useState(DEFAULT_AVATAR);
   const [role, setRole] = useState<UserRole>("Secrétaire");
   const [tribunal, setTribunal] = useState("TGI du Mfoundi (Yaoundé)");
   const [mfaEnabled, setMfaEnabled] = useState(true);
   const [biometricRegistered, setBiometricRegistered] = useState(true);
   const [submittingUser, setSubmittingUser] = useState(false);
+
+  // Password states
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [showPasswordSection, setShowPasswordSection] = useState(false);
+
+  // Avatar upload states
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement>(null);
   
   // Granular Permissions states for editing/creating
   const [permCreateCases, setPermCreateCases] = useState(true);
@@ -180,6 +182,47 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     }
   }, [role, editingUser]);
 
+  // =========================================================================
+  // Avatar upload to Supabase Storage
+  // =========================================================================
+  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setErrorMsg("Le fichier doit être une image (JPEG, PNG, WebP).");
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setErrorMsg("La photo ne doit pas dépasser 2 Mo.");
+      return;
+    }
+
+    setUploadingAvatar(true);
+    setErrorMsg("");
+
+    try {
+      const fileExt = file.name.split('.').pop();
+      const fileName = `${editingUser?.id || `new_${Date.now()}`}_${Date.now()}.${fileExt}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from('avatars')
+        .upload(fileName, file, { upsert: true });
+
+      if (uploadError) throw uploadError;
+
+      const { data: { publicUrl } } = supabase.storage
+        .from('avatars')
+        .getPublicUrl(fileName);
+
+      setAvatar(publicUrl);
+    } catch (err: any) {
+      setErrorMsg("Erreur lors du téléchargement de la photo.");
+      console.error(err);
+    } finally {
+      setUploadingAvatar(false);
+    }
+  };
+
   // --- Handlers for User Accounts & Permissions ---
   const handleCreateOrUpdateUser = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -203,21 +246,33 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
 
     try {
       if (editingUser) {
-        // UPDATE PATH
-        const { data: updated, error } = await supabase
-          .from('users')
-          .update({
-            full_name: fullName,
-            role,
-            tribunal,
-            avatar,
-          })
-          .eq('id', editingUser.id)
-          .select()
-          .single();
+        // UPDATE PATH — use RPC for full profile update
+        const { data: profileOk, error: profileError } = await supabase.rpc("update_user_profile", {
+          p_user_id: editingUser.id,
+          p_full_name: fullName,
+          p_role: role,
+          p_tribunal: tribunal,
+          p_avatar: avatar || null,
+          p_mfa_enabled: mfaEnabled,
+          p_biometric_registered: biometricRegistered,
+          p_active: editingUser.active !== false,
+        });
 
         setSubmittingUser(false);
-        if (error) { setErrorMsg(error.message || "Erreur lors de la mise à jour de l'agent."); return; }
+        if (profileError) { setErrorMsg(profileError.message || "Erreur lors de la mise à jour de l'agent."); return; }
+
+        // Update password if provided
+        if (newPassword && showPasswordSection) {
+          if (newPassword !== confirmPassword) {
+            setErrorMsg("Les mots de passe ne correspondent pas.");
+            return;
+          }
+          const { error: pwError } = await supabase.rpc("update_user_password", {
+            p_user_id: editingUser.id,
+            p_new_password: newPassword,
+          });
+          if (pwError) { setErrorMsg(pwError.message || "Erreur lors de la mise à jour du mot de passe."); return; }
+        }
 
         // Update permissions
         await supabase
@@ -232,14 +287,26 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
           })
           .eq('user_id', editingUser.id);
 
-        await logActivity(currentUser.id, 'MIS_A_JOUR_HABILITATIONS', `Habilitations granulaires modifiées pour ${fullName}`);
+        await logActivity(currentUser.id, 'MIS_A_JOUR_PROFIL_AGENT', `Profil mis à jour pour ${fullName} (${role})`);
 
-        setSuccessMsg(`Les habilitations de l'agent ${fullName} ont été configurées avec succès.`);
+        setSuccessMsg(`Le profil de l'agent ${fullName} a été mis à jour avec succès.`);
         cancelEditUser();
         fetchUsers();
         if (onRefreshLogs) onRefreshLogs();
       } else {
-        // CREATE PATH — check uniqueness first
+        // CREATE PATH — validate password
+        if (!newPassword || newPassword.length < 4) {
+          setSubmittingUser(false);
+          setErrorMsg("Veuillez définir un mot de passe d'au moins 4 caractères.");
+          return;
+        }
+        if (newPassword !== confirmPassword) {
+          setSubmittingUser(false);
+          setErrorMsg("Les mots de passe ne correspondent pas.");
+          return;
+        }
+
+        // check uniqueness first
         const { data: existing } = await supabase
           .from('users')
           .select('id')
@@ -253,7 +320,6 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
         }
 
         const newUserId = `u_${Date.now()}`;
-        const finalAvatar = avatar || AVATAR_PRESETS[0];
 
         const { data: newUser, error: userError } = await supabase
           .from('users')
@@ -263,10 +329,10 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
             full_name: fullName.trim(),
             role,
             tribunal: tribunal.trim(),
-            avatar: finalAvatar,
+            avatar: avatar || null,
             mfa_enabled: mfaEnabled ?? true,
             biometric_registered: biometricRegistered ?? true,
-            password_hash: "$2b$12$LJ3m5ys2LkG9RrLqT6W3XeZ7p1K9w0mN5b8v2q4x6zA0c3E5g7I9",
+            password: newPassword,
             active: true,
           })
           .select()
@@ -309,7 +375,12 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     setUsername(user.username);
     setRole(user.role);
     setTribunal(user.tribunal);
-    setAvatar(user.avatar || AVATAR_PRESETS[0]);
+    setAvatar(user.avatar || DEFAULT_AVATAR);
+    setMfaEnabled(user.mfaEnabled);
+    setBiometricRegistered(user.biometricRegistered);
+    setNewPassword("");
+    setConfirmPassword("");
+    setShowPasswordSection(false);
     
     // Load granular permissions
     const perms = user.permissions || {
@@ -340,7 +411,10 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
     }
     setMfaEnabled(true);
     setBiometricRegistered(true);
-    setAvatar(AVATAR_PRESETS[0]);
+    setAvatar(DEFAULT_AVATAR);
+    setNewPassword("");
+    setConfirmPassword("");
+    setShowPasswordSection(false);
     
     // Default permissions back
     setPermCreateCases(true);
@@ -857,60 +931,68 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
 
               <form onSubmit={handleCreateOrUpdateUser} className="space-y-4">
                 
-                {/* Photo de profil / Sélecteur d'avatar */}
-                <div className="bg-slate-50 p-4.5 rounded-xl border border-slate-200 space-y-3">
+                {/* Photo de profil — upload réelle */}
+                <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
                   <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
                     Photo d'identité de l'agent
                   </label>
                   
                   <div className="flex items-center gap-4">
-                    {/* Grand aperçu de l'avatar sélectionné */}
+                    {/* Aperçu de l'avatar */}
                     <div className="relative shrink-0">
-                      <img 
-                        src={avatar} 
-                        alt="Aperçu" 
-                        className="h-16 w-16 rounded-full object-cover border-2 border-blue-600 shadow-md bg-white"
-                      />
-                      <div className="absolute -bottom-1 -right-1 bg-blue-600 text-white rounded-full p-1 shadow">
-                        <Check className="h-3 w-3 font-bold" />
-                      </div>
+                      {avatar ? (
+                        <img 
+                          src={avatar} 
+                          alt="Aperçu" 
+                          className="h-16 w-16 rounded-full object-cover border-2 border-blue-600 shadow-md bg-white"
+                        />
+                      ) : (
+                        <div className="h-16 w-16 rounded-full border-2 border-slate-300 shadow-md bg-white flex items-center justify-center text-slate-400">
+                          <Users className="h-8 w-8" />
+                        </div>
+                      )}
+                      {avatar && (
+                        <div className="absolute -bottom-1 -right-1 bg-blue-600 text-white rounded-full p-1 shadow">
+                          <Check className="h-3 w-3 font-bold" />
+                        </div>
+                      )}
                     </div>
 
-                    <div className="space-y-2">
+                    <div className="space-y-2 flex-1">
                       <span className="text-[10px] text-slate-500 font-medium leading-tight block">
-                        Sélectionnez un portrait officiel ci-dessous pour illustrer le profil de l'agent dans l'annuaire judiciaire.
+                        Téléchargez la photo d'identité officielle de l'agent (JPEG, PNG — max 2 Mo).
                       </span>
                       
-                      {/* Choix des photos miniatures */}
-                      <div className="flex flex-wrap gap-2">
-                        {AVATAR_PRESETS.map((presetUrl, idx) => {
-                          const isSelected = avatar === presetUrl;
-                          return (
-                            <button
-                              key={idx}
-                              type="button"
-                              onClick={() => setAvatar(presetUrl)}
-                              className={`relative h-9 w-9 rounded-full overflow-hidden transition-all duration-250 cursor-pointer ${
-                                isSelected 
-                                  ? "ring-2 ring-blue-600 ring-offset-2 scale-110 shadow-sm" 
-                                  : "opacity-70 hover:opacity-100 hover:scale-105"
-                              }`}
-                            >
-                              <img 
-                                src={presetUrl} 
-                                alt={`Option ${idx + 1}`} 
-                                className="h-full w-full object-cover"
-                              />
-                              {isSelected && (
-                                <div className="absolute inset-0 bg-blue-600/10 flex items-center justify-center">
-                                  <div className="bg-blue-600 rounded-full p-0.5">
-                                    <Check className="h-2 w-2 text-white" />
-                                  </div>
-                                </div>
-                              )}
-                            </button>
-                          );
-                        })}
+                      <input
+                        ref={avatarInputRef}
+                        type="file"
+                        accept="image/jpeg,image/png,image/webp"
+                        className="hidden"
+                        onChange={handleAvatarUpload}
+                      />
+
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => avatarInputRef.current?.click()}
+                          disabled={uploadingAvatar}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-[10px] font-bold rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
+                        >
+                          {uploadingAvatar ? (
+                            <><RefreshCw className="h-3 w-3 animate-spin" /> Envoi...</>
+                          ) : (
+                            <><Camera className="h-3 w-3" /> Choisir une photo</>
+                          )}
+                        </button>
+                        {avatar && (
+                          <button
+                            type="button"
+                            onClick={() => setAvatar(DEFAULT_AVATAR)}
+                            className="flex items-center gap-1 px-2 py-1.5 bg-slate-200 hover:bg-red-100 text-slate-600 hover:text-red-600 text-[10px] font-bold rounded-lg transition-colors cursor-pointer"
+                          >
+                            <X className="h-3 w-3" /> Retirer
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -926,10 +1008,81 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
                     placeholder="ex: M. le Juge Emmanuel Nsame"
                     value={fullName}
                     onChange={(e) => setFullName(e.target.value)}
-                    disabled={!!editingUser} // Can't rename identity from here to prevent audit fraud
+                    disabled={!!editingUser} // L'identifiant ne peut pas être modifié après création
                     className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-xs text-slate-800 focus:outline-none focus:bg-white focus:ring-1 focus:ring-blue-500 font-sans disabled:opacity-60"
                   />
                 </div>
+
+                {/* Password fields — always visible (required for create, optional for edit) */}
+                {editingUser ? (
+                  <div className="bg-amber-50 p-3 rounded-xl border border-amber-200 space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowPasswordSection(!showPasswordSection)}
+                      className="flex items-center justify-between w-full text-left"
+                    >
+                      <span className="flex items-center gap-1.5 text-xs font-bold text-amber-800">
+                        <Lock className="h-3.5 w-3.5" /> Mot de passe
+                      </span>
+                      <span className="text-[10px] text-amber-600 font-medium">
+                        {showPasswordSection ? "Masquer" : "Modifier"}
+                      </span>
+                    </button>
+                    {showPasswordSection && (
+                      <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="space-y-2 pt-1">
+                        <input
+                          type="password"
+                          placeholder="Nouveau mot de passe (min. 4 car.)"
+                          value={newPassword}
+                          onChange={(e) => setNewPassword(e.target.value)}
+                          className="w-full bg-white border border-slate-200 rounded-lg p-2.5 text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-amber-500 font-sans"
+                        />
+                        <input
+                          type="password"
+                          placeholder="Confirmer le nouveau mot de passe"
+                          value={confirmPassword}
+                          onChange={(e) => setConfirmPassword(e.target.value)}
+                          className="w-full bg-white border border-slate-200 rounded-lg p-2.5 text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-amber-500 font-sans"
+                        />
+                        {newPassword && confirmPassword && newPassword !== confirmPassword && (
+                          <p className="text-[10px] text-red-600 font-medium">Les mots de passe ne correspondent pas.</p>
+                        )}
+                      </motion.div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
+                        Mot de passe *
+                      </label>
+                      <input
+                        type="password"
+                        required
+                        placeholder="Définir un mot de passe (min. 4 caractères)"
+                        value={newPassword}
+                        onChange={(e) => setNewPassword(e.target.value)}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-xs text-slate-800 focus:outline-none focus:bg-white focus:ring-1 focus:ring-blue-500 font-sans"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1">
+                        Confirmer le mot de passe *
+                      </label>
+                      <input
+                        type="password"
+                        required
+                        placeholder="Ressaisir le mot de passe"
+                        value={confirmPassword}
+                        onChange={(e) => setConfirmPassword(e.target.value)}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-xs text-slate-800 focus:outline-none focus:bg-white focus:ring-1 focus:ring-blue-500 font-sans"
+                      />
+                      {confirmPassword && newPassword !== confirmPassword && (
+                        <p className="text-[10px] text-red-600 font-medium mt-1">Les mots de passe ne correspondent pas.</p>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 {!editingUser && (
                   <div>
@@ -1082,8 +1235,8 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
 
                 </div>
 
-                {!editingUser && (
-                  <div className="bg-slate-50/50 p-3 rounded-lg border border-slate-200 space-y-2 text-xs">
+                {/* Security settings — visible in both create and edit modes */}
+                <div className="bg-slate-50/50 p-3 rounded-lg border border-slate-200 space-y-2 text-xs">
                     <span className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider">Sécurité d'enrôlement</span>
                     
                     <label className="flex items-center gap-2 cursor-pointer">
@@ -1106,7 +1259,6 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
                       Activer le scanner d'empreinte biométrique
                     </label>
                   </div>
-                )}
 
                 <button
                   type="submit"
