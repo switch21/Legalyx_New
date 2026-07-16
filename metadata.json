@@ -1,0 +1,7 @@
+{
+  "name": "Legalyx-CMS",
+  "description": "Court Management System (CMS) sécurisé destiné à la gestion des tribunaux camerounais intégrant la numérisation des dossiers, le suivi des audiences, la génération de comptes-rendus par IA et l'authentification multifacteur.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+//test
