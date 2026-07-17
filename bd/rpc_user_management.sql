@@ -18,6 +18,7 @@ BEGIN;
 -- SECURITY DEFINER contourne RLS pour permettre la mise à jour
 -- depuis le rôle anon.
 
+DROP FUNCTION IF EXISTS update_user_profile(VARCHAR, VARCHAR, VARCHAR, VARCHAR, TEXT, BOOLEAN, BOOLEAN, BOOLEAN);
 CREATE OR REPLACE FUNCTION update_user_profile(
   p_user_id           VARCHAR(50),
   p_full_name         VARCHAR,
@@ -56,6 +57,7 @@ $$;
 -- Met à jour le mot de passe d'un utilisateur.
 -- Sécurité : SECURITY DEFINER contourne RLS.
 
+DROP FUNCTION IF EXISTS update_user_password(VARCHAR, VARCHAR);
 CREATE OR REPLACE FUNCTION update_user_password(
   p_user_id     VARCHAR(50),
   p_new_password VARCHAR(255)

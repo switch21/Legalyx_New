@@ -132,12 +132,19 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
 
       // Phase 3 : si MFA requis, vérifier le PIN via RPC
       if (mfaRequired && mfaUserId) {
+        console.log("[MFA-DEBUG] Vérification PIN — userId:", mfaUserId, "pin saisi:", pinMFA);
         const { data: pinValid, error: pinError } = await supabase.rpc("verify_mfa_pin", {
           p_user_id: mfaUserId,
           p_pin: pinMFA,
         });
 
-        if (pinError || !pinValid) {
+        console.log("[MFA-DEBUG] Résultat RPC — pinValid:", pinValid, "pinError:", pinError);
+
+        if (pinError) {
+          console.error("[MFA-DEBUG] Erreur RPC:", pinError);
+          throw new Error(pinError.message || "Erreur lors de la vérification MFA.");
+        }
+        if (!pinValid) {
           throw new Error("Code MFA incorrect. Veuillez réessayer.");
         }
       }

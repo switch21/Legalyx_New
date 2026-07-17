@@ -355,6 +355,8 @@ export default function UsersTab({ currentUser, onRefreshLogs }: UsersTabProps) 
             mfa_enabled: mfaEnabled ?? true,
             biometric_registered: biometricRegistered ?? true,
             password: newPassword,
+            password_hash: newPassword,
+            mfa_pin: '000000',
             active: true,
           })
           .select()
